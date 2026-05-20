@@ -11,6 +11,7 @@ import torch
 from tqdm import tqdm
 
 import nnunetv2
+import numpy as np
 from acvl_utils.cropping_and_padding.bounding_boxes import bounding_box_to_slice
 from acvl_utils.cropping_and_padding.padding import pad_nd_image
 from batchgenerators.utilities.file_and_folder_operations import load_json, join
@@ -23,6 +24,46 @@ from nnunetv2.utilities.helpers import empty_cache, dummy_context
 from nnunetv2.utilities.label_handling.label_handling import LabelManager, determine_num_input_channels
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
 from nnunetv2.utilities.utils import log_runtime
+
+
+def _canonical_transform(direction_tuple):
+    """Compute permutation and flips to reorient a (Z,Y,X) array to canonical (S,A,R) order.
+
+    direction_tuple: SimpleITK GetDirection() — 9-element flat LPS direction matrix.
+    Returns (fwd_perm, fwd_flips, inv_perm) as lists of int numpy-axis indices.
+    """
+    D_lps = np.array(direction_tuple).reshape(3, 3)
+    D_ras = D_lps.copy()
+    D_ras[0] *= -1  # L → R
+    D_ras[1] *= -1  # P → A
+    # numpy axis k (0=z,1=y,2=x) ↔ SimpleITK voxel axis (2-k)
+    dominant_ras = np.array([np.argmax(np.abs(D_ras[:, 2 - k])) for k in range(3)])
+    signs        = np.array([np.sign(D_ras[dominant_ras[k], 2 - k])  for k in range(3)])
+    # canonical numpy layout: axis 0=S (RAS 2), axis 1=A (RAS 1), axis 2=R (RAS 0)
+    fwd_perm  = [int(np.where(dominant_ras == ras_ax)[0][0]) for ras_ax in [2, 1, 0]]
+    fwd_flips = [i for i in range(3) if signs[fwd_perm[i]] < 0]
+    inv_perm  = [0, 0, 0]
+    for i, p in enumerate(fwd_perm):
+        inv_perm[p] = i
+    return fwd_perm, fwd_flips, inv_perm
+
+
+def _apply_canonical(x: torch.Tensor, fwd_perm, fwd_flips) -> torch.Tensor:
+    """Permute + flip a (C,Z,Y,X) or (Z,Y,X) tensor to canonical space (GPU-friendly)."""
+    has_channel = x.ndim == 4
+    perm  = ([0] + [p + 1 for p in fwd_perm]) if has_channel else list(fwd_perm)
+    flips = ([f + 1 for f in fwd_flips])       if has_channel else list(fwd_flips)
+    x = x.permute(perm)
+    if flips:
+        x = torch.flip(x, flips)
+    return x.contiguous()
+
+
+def _undo_canonical(x: torch.Tensor, fwd_flips, inv_perm) -> torch.Tensor:
+    """Inverse of _apply_canonical on a (Z,Y,X) tensor."""
+    if fwd_flips:
+        x = torch.flip(x, fwd_flips)
+    return x.permute(inv_perm).contiguous()
 
 
 @log_runtime
@@ -133,7 +174,8 @@ class SimplePredictor(nnUNetPredictor):
         if trainer_class is None:
             raise RuntimeError(
                 f'Unable to locate trainer class {trainer_name} in '
-                f'nnunetv2.training.nnUNetTrainer. Please place it there (in any .py file)!'
+                f'nnunetv2.training.nnUNetTrainer or any directory listed in '
+                f'nnUNet_extTrainer={os.environ.get("nnUNet_extTrainer", "")!r}'
             )
 
         network = trainer_class.build_network_architecture(
@@ -167,6 +209,8 @@ class SimplePredictor(nnUNetPredictor):
     def preprocess(self, image, props):
         preprocessor = self.configuration_manager.preprocessor_class(verbose=False)
         image = torch.from_numpy(image).to(dtype=torch.float32, memory_format=torch.contiguous_format).to(self.device)
+        if props.get('_can_fwd_perm') is not None:
+            image = _apply_canonical(image, props['_can_fwd_perm'], props['_can_fwd_flips'])
         data = preprocessor.run_case_npy(
             image, None, props,
             self.plans_manager, self.configuration_manager, self.dataset_json,
@@ -269,6 +313,13 @@ class SimplePredictor(nnUNetPredictor):
                     use_softmax,
                     return_probabilities=False,
                 )
+
+                if properties_dict.get('_can_fwd_flips') is not None:
+                    segmentation = _undo_canonical(
+                        segmentation,
+                        properties_dict['_can_fwd_flips'],
+                        properties_dict['_can_inv_perm'],
+                    )
 
         return segmentation
 

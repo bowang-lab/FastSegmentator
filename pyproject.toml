@@ -1,0 +1,22 @@
+[project]
+name = "fastsegmentator"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = [
+    "nnunetv2",
+    "totalsegmentator",
+    "cupy-cuda12x",
+    "torch==2.5.1",
+    "torchvision==0.20.1",
+]
+
+[tool.uv.sources]
+nnunetv2 = { path = "nnUNet", editable = true }
+totalsegmentator = { path = "../TotalSegmentator", editable = true }
+torch = { index = "pytorch-cu121" }
+torchvision = { index = "pytorch-cu121" }
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true

@@ -1,0 +1,5 @@
+.claude/
+.wolf/
+CLAUDE.md
+__pycache__/
+*.pyc

@@ -19,7 +19,13 @@ def create_nonzero_mask(data):
     nonzero_mask = data[0] != 0
     for c in range(1, data.shape[0]):
         nonzero_mask |= data[c] != 0
-    if data.is_cuda:
+    if isinstance(data, torch.Tensor) and data.is_cuda:
+        # binary_fill_holes requires a CuPy array; convert via __cuda_array_interface__
+        filled_cp = ndimage.binary_fill_holes(cp.asarray(nonzero_mask))
+        filled_mask = torch.as_tensor(filled_cp, device=data.device)
+    elif isinstance(data, torch.Tensor):
+        filled_mask = torch.as_tensor(binary_fill_holes(nonzero_mask.numpy()))
+    elif isinstance(data, cp.ndarray):
         filled_mask = ndimage.binary_fill_holes(nonzero_mask)
     else:
         filled_mask = binary_fill_holes(nonzero_mask)
@@ -102,20 +108,29 @@ def crop_to_nonzero(data, seg=None, nonzero_label=-1):
     :return:
     """
     nonzero_mask = create_nonzero_mask(data)
-    if data.is_cuda:
+    is_cuda = isinstance(data, torch.Tensor) and data.is_cuda
+    if is_cuda:
+        bbox = get_bbox_from_mask(cp.asarray(nonzero_mask))
+    elif isinstance(data, cp.ndarray):
         bbox = get_bbox_from_mask(nonzero_mask)
     else:
         bbox = get_bbox_from_mask_cpu(nonzero_mask)
     slicer = bounding_box_to_slice(bbox)
     nonzero_mask = nonzero_mask[slicer][None]
-    
+
     slicer = (slice(None), ) + slicer
     data = data[slicer]
     if seg is not None:
         seg = seg[slicer]
         seg[(seg == 0) & (~nonzero_mask)] = nonzero_label
     else:
-        seg = np.where(nonzero_mask, np.int8(0), np.int8(nonzero_label))
+        if isinstance(nonzero_mask, torch.Tensor):
+            nm_np = nonzero_mask.cpu().numpy()
+        elif isinstance(nonzero_mask, cp.ndarray):
+            nm_np = cp.asnumpy(nonzero_mask)
+        else:
+            nm_np = nonzero_mask
+        seg = np.where(nm_np, np.int8(0), np.int8(nonzero_label))
         seg = torch.as_tensor(seg).to(data.device)
     return data, seg, bbox
 
