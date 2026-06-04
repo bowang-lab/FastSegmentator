@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>TotalSegmentator — mode pipelines (diff vs. `total`)</title>
+<style>
+  :root { --fg:#1b1f23; --muted:#6a737d; --bg:#fff; --row:#f6f8fa; --line:#d0d7de; --accent:#0969da; --code:#f3f3f3; }
+  body { font:14px/1.55 -apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif; color:var(--fg); background:var(--bg); margin:32px auto; max-width:1180px; padding:0 24px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  h2 { font-size:17px; margin:32px 0 8px; padding-bottom:4px; border-bottom:1px solid var(--line); }
+  h3 { font-size:14px; margin:18px 0 6px; }
+  p.lede { color:var(--muted); margin:0 0 18px; }
+  code, kbd { background:var(--code); padding:1px 5px; border-radius:4px; font:12.5px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  table { border-collapse:collapse; width:100%; margin:8px 0 12px; font-size:12.8px; }
+  th, td { border:1px solid var(--line); padding:6px 8px; text-align:left; vertical-align:top; }
+  th { background:#f0f3f6; font-weight:600; }
+  tr:nth-child(even) td { background:var(--row); }
+  td.mode { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; white-space:nowrap; }
+  td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  td.center { text-align:center; }
+  ol.steps { padding-left:22px; }
+  ol.steps li { margin:3px 0; }
+  .pill { display:inline-block; padding:1px 7px; border-radius:10px; font-size:11.5px; background:#eef3fa; color:#0a3b73; border:1px solid #c7dafc; }
+  .pill.warn { background:#fff5e6; color:#8a5a00; border-color:#f3d18a; }
+  .pill.lic { background:#fdebeb; color:#9c1b1b; border-color:#f5b8b8; }
+  .small { color:var(--muted); font-size:12px; }
+  .legend { display:flex; flex-wrap:wrap; gap:8px; margin:6px 0 14px; }
+  .legend span { font-size:12px; color:var(--muted); }
+  details { margin:6px 0 16px; }
+  summary { cursor:pointer; color:var(--accent); font-weight:600; }
+</style>
+</head>
+<body>
+
+<h1>TotalSegmentator — mode pipelines vs. <code>total</code></h1>
+<p class="lede">
+  Every mode runs through the same backbone (<code>nnUNet_predict_image</code> in
+  <code>totalsegmentator/nnunet.py</code>). Modes differ only in configuration set by
+  the dispatcher in <code>totalsegmentator/python_api.py</code>: which nnU&#8209;Net
+  task(s), what target spacing, which trainer, whether to crop with a rough
+  pre&#8209;segmentation, and a handful of mode&#8209;specific post&#8209;processing branches.
+  This page ignores the <code>--fast</code> / <code>--fastest</code> /
+  <code>--higher_order_resampling</code> / <code>--roi_subset</code> toggles and lists only the
+  mode itself.
+</p>
+
+<div class="legend">
+  <span><span class="pill">CT</span> CT-only mode</span>
+  <span><span class="pill warn">MR</span> MR-only mode</span>
+  <span><span class="pill lic">licensed</span> Commercial mode, gated by <code>show_license_info()</code></span>
+</div>
+
+<h2>0. Shared backbone (what <em>every</em> mode does)</h2>
+<ol class="steps">
+  <li><b>Optional rough-seg pre-pass</b> (only if the mode declares a <code>crop</code> ROI list or a <code>crop_model</code>). Runs <code>total</code>/<code>total_mr</code>/<code>body</code> at coarse spacing, then builds a binary mask from the listed ROI labels.</li>
+  <li><b>Crop</b> the input to that binary mask with a per-mode voxel margin (<code>crop_addon</code>).</li>
+  <li><b>Reorient</b> to closest canonical (LAS).</li>
+  <li><b>Forward resample</b> to <code>resample</code> mm, cubic spline on GPU (cucim, <code>order=3</code>).</li>
+  <li><b>Optional Z-split into 3 sub-volumes</b> (multi-model modes only, when the volume exceeds 512·512·900 voxels and Z &gt; 200).</li>
+  <li><b>nnU-Net predict</b> with sliding window; tile step 0.8 only for plain CT <code>total</code>, otherwise 0.5.</li>
+  <li><b>Merge multi-model outputs</b> into one label volume (only multi-model modes: <code>total</code>, <code>total_mr</code>, <code>headneck_muscles</code>).</li>
+  <li><b>Per-mode postprocess</b> (only fires for <code>body</code>, <code>appendicular_bones</code>, <code>kidney_cysts</code>, <code>face_mr</code>, <code>heartchambers_highres</code>).</li>
+  <li><b>Inverse resample</b> with nearest-neighbour, <b>undo canonical</b>, <b>undo crop</b>.</li>
+  <li><b>Save</b> multilabel NIfTI (and for <code>body</code>: derived <code>body.nii.gz</code> + <code>skin.nii.gz</code>).</li>
+</ol>
+
+<h2>1. Reference: <code>total</code> (CT)</h2>
+<table>
+  <tr><th style="width:18%">Field</th><th>Value</th></tr>
+  <tr><td>nnU-Net task(s)</td><td><code>[291, 292, 293, 294, 295]</code> — 5-model ensemble: organs / vertebrae / cardiac / muscles / ribs</td></tr>
+  <tr><td>Resample</td><td>1.5 mm isotropic</td></tr>
+  <tr><td>Trainer</td><td><code>nnUNetTrainerNoMirroring</code></td></tr>
+  <tr><td>Model</td><td><code>3d_fullres</code>, fold 0</td></tr>
+  <tr><td>Crop pre-pass</td><td>None — runs on the full image</td></tr>
+  <tr><td>Tile step</td><td>0.8 (faster sliding window; only plain <code>total</code> gets this)</td></tr>
+  <tr><td>Z-split</td><td>Eligible (multi-model)</td></tr>
+  <tr><td>Output classes</td><td>117 (merged via <code>class_map_5_parts</code> + <code>map_taskid_to_partname_ct</code>)</td></tr>
+  <tr><td>Postprocess</td><td>None mode-specific (just generic resample/undo)</td></tr>
+</table>
+
+<h2>2. CT modes — diff vs. <code>total</code></h2>
+<p class="small">Everything below replaces the corresponding field in section 1. Empty cells mean "same as <code>total</code>" or "not applicable".</p>
+
+<h3>2.1 Multi-region open CT modes</h3>
+<table>
+  <tr>
+    <th>Mode</th><th>nnU-Net task(s)</th><th>Resample (mm)</th><th>Trainer</th><th>Model</th>
+    <th>Crop ROI(s)</th><th>Margin</th><th>Classes</th><th>Notes vs. <code>total</code></th>
+  </tr>
+
+  <tr><td class="mode">lung_vessels</td><td>117</td><td>0.703 × 0.703 × 1.0</td><td>SkeletonRecall</td><td>3d_fullres</td>
+      <td>5 lung lobes</td><td class="num">3</td><td class="num">4</td>
+      <td>Adds crop pre-pass; single model (no Z-split); step 0.5.</td></tr>
+
+  <tr><td class="mode">lung_vessels_LEGACY</td><td>258</td><td>native</td><td>nnUNetTrainer</td><td>3d_fullres</td>
+      <td>5 lung lobes</td><td class="num">3</td><td class="num">4</td>
+      <td>No forward resample (predicts at the image's own spacing).</td></tr>
+
+  <tr><td class="mode">lung_nodules</td><td>913</td><td>1.5 iso</td><td>MOSAIC_1k_QuarterLR_NoMirroring</td><td>3d_fullres</td>
+      <td>5 lung lobes</td><td class="num">10</td><td class="num">2</td>
+      <td>Custom MOSAIC trainer.</td></tr>
+
+  <tr><td class="mode">pleural_pericard_effusion</td><td>315</td><td>native</td><td>nnUNetTrainer</td><td>3d_fullres</td>
+      <td>5 lung lobes</td><td class="num">50</td><td class="num">3</td>
+      <td>Native spacing; large 50-vx margin; <b>all folds ensembled</b>.</td></tr>
+
+  <tr><td class="mode">cerebral_bleed</td><td>150</td><td>native</td><td>nnUNetTrainer</td><td>3d_fullres</td>
+      <td>brain</td><td class="num">3</td><td class="num">1</td>
+      <td>Crop to brain only.</td></tr>
+
+  <tr><td class="mode">hip_implant</td><td>260</td><td>native</td><td>nnUNetTrainer</td><td>3d_fullres</td>
+      <td>femur ± hip L/R</td><td class="num">3</td><td class="num">1</td>
+      <td>Crop to pelvis.</td></tr>
+
+  <tr><td class="mode">liver_vessels</td><td>8</td><td>native</td><td>nnUNetTrainer</td><td>3d_fullres</td>
+      <td>liver</td><td class="num">20</td><td class="num">2</td>
+      <td>Native spacing.</td></tr>
+
+  <tr><td class="mode">liver_segments</td><td>570</td><td>0.805 × 0.805 × 1.5</td><td>NoMirroring</td><td>3d_fullres</td>
+      <td>liver</td><td class="num">10</td><td class="num">8</td>
+      <td>—</td></tr>
+
+  <tr><td class="mode">liver_lesions</td><td>591</td><td>0.75 × 0.75 × 1.0</td><td>nnUNetTrainer</td><td><b>3d_fullres_high</b></td>
+      <td>liver</td><td class="num">10</td><td class="num">1</td>
+      <td>Uses higher-resolution plans-file.</td></tr>
+
+  <tr><td class="mode">kidney_cysts</td><td>789</td><td>1.5 iso</td><td>DASegOrd0_NoMirroring</td><td>3d_fullres</td>
+      <td>kidneys, liver, spleen, colon</td><td class="num">10</td><td class="num">2</td>
+      <td>Drops auxiliary labels declared in <code>kidney_cysts_auxiliary</code>.</td></tr>
+
+  <tr><td class="mode">breasts</td><td>527</td><td>1.5 iso</td><td>DASegOrd0_NoMirroring</td><td>3d_fullres</td>
+      <td>—</td><td class="num">—</td><td class="num">1</td>
+      <td>No crop pre-pass.</td></tr>
+
+  <tr><td class="mode">trunk_cavities</td><td>343</td><td>1.5 iso</td><td>nnUNetTrainer</td><td>3d_fullres</td>
+      <td>—</td><td class="num">—</td><td class="num">4</td>
+      <td>No crop pre-pass.</td></tr>
+
+  <tr><td class="mode">body</td><td>299</td><td>1.5</td><td>nnUNetTrainer</td><td>3d_fullres</td>
+      <td>—</td><td class="num">—</td><td class="num">2</td>
+      <td><b>Adds postprocess</b>: <code>keep_largest_blob_multilabel(["body_trunc"])</code> + <code>remove_small_blobs_multilabel(["body_extremities"], 50&#160;000&#160;mm³)</code>. On save also writes derived <code>body.nii.gz</code> + <code>skin.nii.gz</code>.</td></tr>
+
+  <tr><td class="mode">abdominal_muscles</td><td>952</td><td>0.75 × 0.75 × 1.0</td><td>DASegOrd0_NoMirroring</td><td><b>3d_fullres_high</b></td>
+      <td>body_trunc</td><td class="num">5</td><td class="num">22</td>
+      <td>Because the crop list contains <code>body_trunc</code>, the rough seg switches to <code>body</code> Task&#160;300 instead of <code>total</code>.</td></tr>
+
+  <tr><td class="mode">head_glands_cavities</td><td>775</td><td>0.75 × 0.75 × 1.0</td><td>DASegOrd0_NoMirroring</td><td><b>3d_fullres_high</b></td>
+      <td>skull</td><td class="num">10</td><td class="num">19</td>
+      <td>—</td></tr>
+
+  <tr><td class="mode">head_muscles</td><td>777</td><td>0.75 × 0.75 × 1.0</td><td>DASegOrd0_NoMirroring</td><td><b>3d_fullres_high</b></td>
+      <td>skull</td><td class="num">10</td><td class="num">11</td>
+      <td>—</td></tr>
+
+  <tr><td class="mode">headneck_bones_vessels</td><td>776</td><td>0.75 × 0.75 × 1.0</td><td>DASegOrd0_NoMirroring</td><td><b>3d_fullres_high</b></td>
+      <td>clavicula L/R, C1, C5, T1, T4</td><td class="num">40</td><td class="num">12</td>
+      <td>Large 40-vx margin to retain neck FOV.</td></tr>
+
+  <tr><td class="mode">headneck_muscles</td><td><b>[778, 779]</b></td><td>0.75 × 0.75 × 1.0</td><td>DASegOrd0_NoMirroring</td><td><b>3d_fullres_high</b></td>
+      <td>clavicula L/R, C1, C5, T1, T4</td><td class="num">40</td><td class="num">23</td>
+      <td><b>Multi-model</b>: own <code>class_map_parts_headneck_muscles</code> + <code>map_taskid_to_partname_headneck_muscles</code>. Z-split eligible.</td></tr>
+
+  <tr><td class="mode">craniofacial_structures</td><td>115</td><td>0.5 iso</td><td>DASegOrd0_NoMirroring</td><td>3d_fullres</td>
+      <td>skull</td><td class="num">20</td><td class="num">7</td>
+      <td>Isotropic 0.5&#160;mm.</td></tr>
+
+  <tr><td class="mode">oculomotor_muscles</td><td>351</td><td>0.473 × 0.473 × 0.85</td><td>DASegOrd0_NoMirroring</td><td>3d_fullres</td>
+      <td>skull</td><td class="num">20</td><td class="num">19</td>
+      <td>Very high in-plane resolution.</td></tr>
+
+  <tr><td class="mode">ventricle_parts</td><td>552</td><td>0.439 × 0.435 × 1.0</td><td>NoMirroring</td><td>3d_fullres</td>
+      <td>brain</td><td class="num">0</td><td class="num">12</td>
+      <td>Zero crop margin.</td></tr>
+
+  <tr><td class="mode">teeth</td><td>113</td><td>0.5 iso</td><td>onlyMirror01</td><td><b>3d_lowres_high</b></td>
+      <td>teeth_lower, teeth_upper</td><td class="num">10</td><td class="num">77</td>
+      <td><b>Recursive crop</b>: instead of the cheap rough <code>total</code> model, dispatcher recurses on <code>task="craniofacial_structures"</code> first, then crops to teeth labels of that result.</td></tr>
+
+  <tr><td class="mode">brain_aneurysm</td><td>615</td><td>0.391 × 0.391 × 0.5</td><td>DiceTopK10Loss_2000epochs</td><td>3d_fullres</td>
+      <td>—</td><td class="num">—</td><td class="num">1</td>
+      <td>No crop. <b>All folds ensembled</b>. Designed for TOF MRI input.</td></tr>
+
+  <tr><td class="mode">total_highres_test</td><td>957</td><td>0.75 × 0.75 × 1.0</td><td>NoMirroring</td><td><b>3d_fullres_high</b></td>
+      <td>—</td><td class="num">—</td><td class="num">24</td>
+      <td>Single-model high-res variant of <code>total</code>; no ensemble.</td></tr>
+</table>
+
+<h3>2.2 Licensed CT modes <span class="pill lic">licensed</span></h3>
+<table>
+  <tr>
+    <th>Mode</th><th>nnU-Net task</th><th>Resample (mm)</th><th>Trainer</th><th>Model</th>
+    <th>Crop ROI(s)</th><th>Margin</th><th>Classes</th><th>Notes vs. <code>total</code></th>
+  </tr>
+  <tr><td class="mode">vertebrae_body</td><td>305</td><td>1.5</td><td>DASegOrd0</td><td>3d_fullres</td>
+      <td>—</td><td class="num">—</td><td class="num">2</td><td>No crop.</td></tr>
+  <tr><td class="mode">appendicular_bones</td><td>304</td><td>1.5</td><td>NoMirroring</td><td>3d_fullres</td>
+      <td>—</td><td class="num">—</td><td class="num">11</td><td><b>Only mode for which <code>remove_auxiliary_labels</code> actually drops labels.</b></td></tr>
+  <tr><td class="mode">tissue_types</td><td>481</td><td>1.5</td><td>nnUNetTrainer</td><td>3d_fullres</td>
+      <td>—</td><td class="num">—</td><td class="num">3</td><td>—</td></tr>
+  <tr><td class="mode">tissue_4_types</td><td>485</td><td>1.5</td><td>nnUNetTrainer</td><td>3d_fullres</td>
+      <td>—</td><td class="num">—</td><td class="num">4</td><td>Adds <code>intermuscular_fat</code>.</td></tr>
+  <tr><td class="mode">face</td><td>303</td><td>1.5</td><td>NoMirroring</td><td>3d_fullres</td>
+      <td>—</td><td class="num">—</td><td class="num">1</td><td>—</td></tr>
+  <tr><td class="mode">brain_structures</td><td>409</td><td>0.5 × 0.5 × 1.0</td><td>DASegOrd0</td><td><b>3d_fullres_high</b></td>
+      <td>brain</td><td class="num">10</td><td class="num">16</td><td>—</td></tr>
+  <tr><td class="mode">heartchambers_highres</td><td>301</td><td>native</td><td>nnUNetTrainer</td><td>3d_fullres</td>
+      <td>heart</td><td class="num">5</td><td class="num">7</td>
+      <td><b>Only mode</b> using <code>remove_outside=[heart, aorta, IVC]</code> + 10&#160;mm dilation as a postprocess.</td></tr>
+  <tr><td class="mode">coronary_arteries</td><td>509</td><td>0.7 iso</td><td>SkeletonRecall</td><td><b>3d_fullres_high</b></td>
+      <td>heart</td><td class="num">20</td><td class="num">1</td><td>SkeletonRecall trainer (vessel skeleton loss).</td></tr>
+  <tr><td class="mode">coronary_arteries_LEGACY</td><td>507</td><td>0.7 iso</td><td>DASegOrd0_NoMirroring</td><td><b>3d_fullres_high</b></td>
+      <td>heart</td><td class="num">20</td><td class="num">1</td><td>—</td></tr>
+  <tr><td class="mode">aortic_sinuses</td><td>920</td><td>0.7 iso</td><td>DASegOrd0_NoMirroring</td><td><b>3d_fullres_high</b></td>
+      <td>heart</td><td class="num">0</td><td class="num">4</td><td>Tight FOV (zero margin).</td></tr>
+  <tr><td class="mode">thigh_shoulder_muscles</td><td>857</td><td>1.5</td><td>2000epochs_NoMirroring</td><td>3d_fullres</td>
+      <td>—</td><td class="num">—</td><td class="num">18</td><td>Shared CT+MR model (same weights as MR variant).</td></tr>
+</table>
+
+<h2>3. MR modes — diff vs. <code>total</code></h2>
+<p class="small">
+  Globally for MR: <code>body_seg</code> is silently disabled. The default rough-crop pre-pass uses <code>total_mr</code> Task&#160;852 at 3&#160;mm (never 6&#160;mm). If the crop list contains <code>body_trunc</code>/<code>body_extremities</code>, the rough seg still falls back to the CT <code>body</code> Task&#160;300 (no MR body model is registered there).
+</p>
+<table>
+  <tr>
+    <th>Mode</th><th>nnU-Net task(s)</th><th>Resample (mm)</th><th>Trainer</th><th>Model</th>
+    <th>Crop ROI(s)</th><th>Margin</th><th>Classes</th><th>Notes vs. <code>total</code></th>
+  </tr>
+  <tr><td class="mode">total_mr <span class="pill warn">MR</span></td><td><b>[850, 851]</b></td><td>1.5 iso</td><td>2000epochs_NoMirroring</td><td>3d_fullres</td>
+      <td>—</td><td class="num">—</td><td class="num">50</td>
+      <td><b>Only 2 sub-models</b> (organs + muscles) — no vertebrae / cardiac / ribs models. <b>Tile step is 0.5</b>, not 0.8 (the speedup is keyed on the literal <code>"total"</code>). Z-split eligible.</td></tr>
+  <tr><td class="mode">body_mr <span class="pill warn">MR</span></td><td>597</td><td>1.5</td><td>DASegOrd0</td><td>3d_fullres</td>
+      <td>—</td><td class="num">—</td><td class="num">2</td>
+      <td><b>Does <em>not</em> run the <code>body</code> postprocess</b> (keep_largest_blob / 50&#160;000&#160;mm³ removal / skin derivation) — those branches are keyed on <code>task=="body"</code> literal.</td></tr>
+  <tr><td class="mode">vertebrae_mr <span class="pill warn">MR</span></td><td>756</td><td>1.5</td><td>DASegOrd0_NoMirroring</td><td>3d_fullres</td>
+      <td>—</td><td class="num">—</td><td class="num">25</td><td>No crop.</td></tr>
+  <tr><td class="mode">liver_segments_mr <span class="pill warn">MR</span></td><td>576</td><td>1.125 × 1.188 × 3.0</td><td>DASegOrd0_NoMirroring</td><td>3d_fullres</td>
+      <td>liver</td><td class="num">10</td><td class="num">8</td>
+      <td>Rough seg via <code>total_mr</code> @ 3&#160;mm. Highly anisotropic target.</td></tr>
+  <tr><td class="mode">liver_lesions_mr <span class="pill warn">MR</span></td><td>589</td><td>0.860 × 0.857 × 1.0</td><td>DASegOrd0</td><td>3d_fullres</td>
+      <td>liver</td><td class="num">3</td><td class="num">1</td><td>Tight crop margin.</td></tr>
+  <tr><td class="mode">appendicular_bones_mr <span class="pill warn">MR</span> <span class="pill lic">licensed</span></td><td>855</td><td>1.5</td><td>2000epochs_NoMirroring</td><td>3d_fullres</td>
+      <td>—</td><td class="num">—</td><td class="num">8</td><td>Licensed.</td></tr>
+  <tr><td class="mode">tissue_types_mr <span class="pill warn">MR</span> <span class="pill lic">licensed</span></td><td>925</td><td>1.5</td><td>DASegOrd0_NoMirroring</td><td>3d_fullres</td>
+      <td>—</td><td class="num">—</td><td class="num">3</td><td>Licensed.</td></tr>
+  <tr><td class="mode">face_mr <span class="pill warn">MR</span> <span class="pill lic">licensed</span></td><td>856</td><td>1.5</td><td>2000epochs_NoMirroring</td><td>3d_fullres</td>
+      <td>—</td><td class="num">—</td><td class="num">1</td>
+      <td><code>remove_auxiliary_labels</code> drops <code>face_mr_auxiliary</code> (brain, liver) before saving.</td></tr>
+  <tr><td class="mode">thigh_shoulder_muscles_mr <span class="pill warn">MR</span> <span class="pill lic">licensed</span></td><td>857</td><td>1.5</td><td>2000epochs_NoMirroring</td><td>3d_fullres</td>
+      <td>—</td><td class="num">—</td><td class="num">18</td><td>Identical weights to the CT variant.</td></tr>
+</table>
+
+<h2>4. Behaviours exclusive to <code>total</code></h2>
+<p class="small">
+  These are gated on the literal string <code>task_name == "total"</code> or on the multi-model shape. Even <code>total_mr</code> does not inherit them.
+</p>
+<ul>
+  <li><b>Sliding-window tile step 0.8</b> — only <code>total</code>. <code>total_mr</code> and every specialty mode use 0.5.</li>
+  <li><b>5-part class merging</b> via <code>class_map_5_parts</code> + <code>map_taskid_to_partname_ct</code>. <code>total_mr</code> uses a 2-part variant; <code>headneck_muscles</code> uses its own 2-part variant; everything else is single-model.</li>
+  <li><b>Triple Z-split</b> is only enabled in multi-model modes (<code>total</code>, <code>total_mr</code>, <code>headneck_muscles</code>).</li>
+  <li><b>v1-label reordering</b> (<code>v1_order=True</code>) — only <code>total</code>.</li>
+  <li><b>ROI-subset filtering</b> is rejected unless <code>task.startswith("total")</code>.</li>
+</ul>
+
+<h2>5. Recursion / cascade specials</h2>
+<ul>
+  <li><b><code>teeth</code></b> is the only mode whose pre-pass is a recursive full TotalSegmentator run (with <code>task="craniofacial_structures"</code>) rather than the cheap rough <code>total</code> model.</li>
+  <li>The <b>cascade input channel</b> (a second nnU-Net input volume carrying a rough segmentation) is wired through the backbone but no enabled mode sets <code>cascade=True</code>; the only branch that did is the commented-out earlier <code>total_highres_test</code>.</li>
+  <li><b><code>heartchambers_highres</code></b> is the only mode that activates the <code>remove_outside_of_mask</code> postprocess (with a 10&#160;mm dilation).</li>
+</ul>
+
+<p class="small" style="margin-top:24px">
+  Source: <code>.venv_official/lib/python3.12/site-packages/totalsegmentator/python_api.py</code> (dispatcher),
+  <code>nnunet.py</code> (backbone), <code>map_to_binary.py</code> (label maps).
+</p>
+
+</body>
+</html>

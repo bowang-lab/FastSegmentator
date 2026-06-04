@@ -324,18 +324,19 @@ class SimplePredictor(nnUNetPredictor):
         return segmentation
 
 
-if __name__ == "__main__":
-    def parse_arguments():
-        parser = argparse.ArgumentParser(description="Inference for nnUNet model")
-        parser.add_argument('-i', '--input_path', type=str, required=True, help='Path to the input image folder')
-        parser.add_argument('-o', '--output_path', type=str, required=True, help='Path to save the output segmentation')
-        parser.add_argument('--model_path', type=str, required=True, help='Path to the trained model directory')
-        parser.add_argument('--fold', type=str, default='all', help='Fold to use for inference (default: all)')
-        parser.add_argument('--checkpoint', type=str, default='checkpoint_final.pth', help='Checkpoint filename')
-        parser.add_argument('--use_softmax', action='store_true', default=False, help='Apply softmax to output')
-        parser.add_argument('--device', type=str, default='cuda', help='Device (e.g., "cuda" or "cpu")')
-        return parser.parse_args()
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Inference for nnUNet model")
+    parser.add_argument('-i', '--input_path', type=str, required=True, help='Path to the input image folder')
+    parser.add_argument('-o', '--output_path', type=str, required=True, help='Path to save the output segmentation')
+    parser.add_argument('--model_path', type=str, required=True, help='Path to the trained model directory')
+    parser.add_argument('--fold', type=str, default='all', help='Fold to use for inference (default: all)')
+    parser.add_argument('--checkpoint', type=str, default='checkpoint_final.pth', help='Checkpoint filename')
+    parser.add_argument('--use_softmax', action='store_true', default=False, help='Apply softmax to output')
+    parser.add_argument('--device', type=str, default='cuda', help='Device (e.g., "cuda" or "cpu")')
+    return parser.parse_args()
 
+
+def main():
     args = parse_arguments()
 
     perform_everything_on_device = args.device != 'cpu'
@@ -375,3 +376,7 @@ if __name__ == "__main__":
 
         case_name = os.path.basename(file).replace('_0000.nii.gz', '.nii.gz')
         sitk.WriteImage(sitk_img, os.path.join(output_folder, case_name))
+
+
+if __name__ == "__main__":
+    main()
