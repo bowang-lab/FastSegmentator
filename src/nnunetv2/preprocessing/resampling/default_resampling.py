@@ -384,9 +384,187 @@ def fast_resample_logit_to_shape(torch_data: Union[torch.Tensor, np.ndarray],
         return reshaped_final_data
     else:
         print("no resampling necessary")
-        if new_shape[0] > 600:
+        # Must match the resample-path boundary (>= 600 → segmentation) and the
+        # caller convert_...(target_shape[0] < 600). Using > 600 here left exactly
+        # Z=600 returning 4D logits where the caller expects a 3D segmentation.
+        if new_shape[0] >= 600:
             torch_data = logit_to_segment(torch_data)
         return torch_data
+
+
+import math as _math
+
+
+def _cubic_bspline_basis(u: torch.Tensor) -> torch.Tensor:
+    """Cubic B-spline kernel B3 evaluated at signed distance `u`."""
+    a = u.abs()
+    w = torch.zeros_like(a)
+    m1 = a < 1.0
+    m2 = (a >= 1.0) & (a < 2.0)
+    w[m1] = 2.0 / 3.0 - a[m1] ** 2 + 0.5 * a[m1] ** 3
+    w[m2] = ((2.0 - a[m2]) ** 3) / 6.0
+    return w
+
+
+def _bspline3_prefilter_lastdim(c: torch.Tensor) -> torch.Tensor:
+    """Cubic B-spline prefilter (Unser/ITK recursive IIR) along the LAST dim.
+    c: (..., n) float. Mirror boundary. Returns spline coefficients, same shape.
+    The python loops run along the (short) filtered axis but are vectorized over all
+    leading dims, so each iteration is a single elementwise kernel on the (...,) plane.
+    """
+    z = _math.sqrt(3.0) - 2.0          # cubic pole
+    n = c.shape[-1]
+    if n == 1:
+        return c
+    c = c * 6.0                         # gain = (1-z)(1-1/z) = 6 for cubic
+    # --- causal: truncated mirror initialization, then forward recursion ---
+    tol = 1e-9
+    horizon = min(n, int(_math.ceil(_math.log(tol) / _math.log(abs(z)))))
+    zk = z
+    c0 = c[..., 0].clone()
+    for k in range(1, horizon):
+        c0 = c0 + zk * c[..., k]
+        zk *= z
+    cols = [c0]
+    prev = c0
+    for k in range(1, n):
+        prev = c[..., k] + z * prev
+        cols.append(prev)
+    c = torch.stack(cols, dim=-1)
+    # --- anti-causal: mirror initialization, then backward recursion ---
+    cols[-1] = (z / (z * z - 1.0)) * (c[..., n - 1] + z * c[..., n - 2])
+    prev = cols[-1]
+    for k in range(n - 2, -1, -1):
+        prev = z * (prev - c[..., k])
+        cols[k] = prev
+    return torch.stack(cols, dim=-1)
+
+
+_CUBIC_NPAD = 12   # scipy.ndimage._interpolation._prepad_for_spline_filter for mode='nearest'
+
+
+def _cubic_resize_lastdim(coeffs: torch.Tensor, n_orig: int, out_size: int,
+                          npad: int = _CUBIC_NPAD) -> torch.Tensor:
+    """Sample cubic B-spline coefficients of a `npad`-edge-padded signal (so coeffs has
+    length n_orig+2*npad) onto `out_size` points. Replicates scipy.ndimage.zoom with
+    grid_mode=True: input coord = (o+0.5)*(n_orig/out_size) - 0.5, shifted by +npad into
+    the padded array. The pad makes the boundary edge/nearest (matching skimage mode='edge')."""
+    npadded = coeffs.shape[-1]
+    device = coeffs.device
+    scale = float(n_orig) / out_size
+    j = torch.arange(out_size, device=device, dtype=torch.float64)
+    x = (j + 0.5) * scale - 0.5 + npad                  # coords into the padded array
+    fl = torch.floor(x)
+    out = torch.zeros(*coeffs.shape[:-1], out_size, device=device, dtype=coeffs.dtype)
+    for o in (-1, 0, 1, 2):
+        m = fl + o
+        w = _cubic_bspline_basis(x - m)                 # (out_size,)
+        idx = m.long().clamp(0, npadded - 1)            # taps stay interior thanks to the pad
+        out = out + coeffs.index_select(-1, idx) * w
+    return out
+
+
+def _gpu_cubic_resample(t: torch.Tensor, new_shape, axes) -> torch.Tensor:
+    """Separable cubic B-spline resample of t (c, *spatial) along `axes` (spatial dims,
+    0-based within spatial) to new_shape sizes. Faithfully reproduces scipy.ndimage.zoom
+    (order=3, mode='nearest', grid_mode=True) — the path nnUNet's resample_data_or_seg
+    takes via skimage.resize(order=3, mode='edge'): 12-voxel edge prepad, B-spline
+    prefilter, then grid-mode cubic sampling. Runs in float64 (scipy uses float64; the IIR
+    recursion amplifies error at sharp edges, so float32 diverges there)."""
+    in_dtype = t.dtype
+    t = t.to(torch.float64)
+    # skimage.resize clips cubic-ringing overshoot back to the input's value range
+    # (_clip_warp_output), per channel — ndi.zoom alone does not. Capture before resampling.
+    flat = t.reshape(t.shape[0], -1)
+    vmin = flat.amin(dim=1).view(-1, *([1] * (t.ndim - 1)))
+    vmax = flat.amax(dim=1).view(-1, *([1] * (t.ndim - 1)))
+    npad = _CUBIC_NPAD
+    for ax in axes:
+        n = t.shape[1 + ax]
+        out_size = int(new_shape[ax])
+        if n == out_size:
+            continue
+        x = t.movedim(1 + ax, -1).contiguous()          # (..., n)
+        left = x[..., :1].expand(*x.shape[:-1], npad)    # edge (replicate) prepad
+        right = x[..., -1:].expand(*x.shape[:-1], npad)
+        x = torch.cat([left, x, right], dim=-1)          # (..., n+2*npad)
+        x = _bspline3_prefilter_lastdim(x)
+        x = _cubic_resize_lastdim(x, n, out_size, npad)
+        t = x.movedim(-1, 1 + ax).contiguous()
+    t = torch.minimum(torch.maximum(t, vmin), vmax)      # _clip_warp_output (per channel)
+    return t.to(in_dtype)
+
+
+def torch_resample_data_or_seg_to_shape(data: Union[torch.Tensor, np.ndarray],
+                                        new_shape: Union[Tuple[int, ...], List[int], np.ndarray],
+                                        current_spacing, new_spacing,
+                                        is_seg: bool = False, order: int = 3, order_z: int = 0,
+                                        force_separate_z: Union[bool, None] = False,
+                                        separate_z_anisotropy_threshold: float = ANISO_THRESHOLD,
+                                        device=None) -> torch.Tensor:
+    """GPU/torch reimplementation of resample_data_or_seg_to_shape, following the SAME
+    separate-z logic as the scipy version (resample_data_or_seg):
+
+      - decide do_separate_z + anisotropic `axis` via determine_do_sep_z_and_axis;
+      - if separate-z: interpolate each axis-slice IN-PLANE (the other two dims) with
+        `order` (0->nearest, 1->bilinear, 3->bicubic), batched over slices; then resample
+        ALONG `axis` with `order_z` (0 -> nearest, matching scipy map_coordinates'
+        scale*(i+0.5)-0.5 / mode='nearest' index mapping);
+      - else: full 3-D trilinear (order>=1) / nearest (order==0), like the current fast path.
+
+    data is (c, x, y, z). Returns a torch.Tensor (c, *new_shape) on `device`.
+    is_seg uses nearest in-plane (order overridden to 0) to avoid label blending.
+    """
+    import torch.nn.functional as F
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    t = (torch.as_tensor(data, dtype=torch.float32, device=device)
+         if isinstance(data, np.ndarray) else data.to(device=device, dtype=torch.float32))
+    c = t.shape[0]
+    shape = list(t.shape[1:])
+    new_shape = [int(s) for s in new_shape]
+    if shape == new_shape:
+        return t
+
+    do_sep, axis = determine_do_sep_z_and_axis(force_separate_z, current_spacing, new_spacing,
+                                               separate_z_anisotropy_threshold)
+    eff_order = 0 if is_seg else order   # segmentation: nearest in-plane
+    mode2d = {0: "nearest", 1: "bilinear", 2: "bilinear", 3: "bicubic"}.get(eff_order, "bilinear")
+
+    def interp2d(x, hw):
+        if mode2d == "nearest":
+            return F.interpolate(x, size=tuple(hw), mode="nearest")
+        if mode2d == "bicubic":                       # order>=2 data: cubic B-spline (matches scipy)
+            return _gpu_cubic_resample(x[:, 0], list(hw), axes=(0, 1)).unsqueeze(1)
+        return F.interpolate(x, size=tuple(hw), mode=mode2d, align_corners=False)
+
+    if do_sep and axis is not None:
+        other = [a for a in (0, 1, 2) if a != axis]
+        tp = t.permute(0, 1 + axis, 1 + other[0], 1 + other[1]).contiguous()   # (c, A, B0, B1)
+        A = tp.shape[1]
+        out_b = (new_shape[other[0]], new_shape[other[1]])
+        x = interp2d(tp.reshape(c * A, 1, tp.shape[2], tp.shape[3]), out_b).reshape(c, A, *out_b)
+        newA = new_shape[axis]
+        if A != newA:                                  # resample along the anisotropic axis
+            if order_z == 0 or is_seg:
+                sc = float(A) / newA
+                idx = torch.round(sc * (torch.arange(newA, device=device) + 0.5) - 0.5).clamp(0, A - 1).long()
+                x = x.index_select(1, idx)
+            else:
+                x = x.permute(0, 2, 3, 1).reshape(c * out_b[0] * out_b[1], 1, A)
+                x = F.interpolate(x, size=newA, mode="linear", align_corners=False)
+                x = x.reshape(c, out_b[0], out_b[1], newA).permute(0, 3, 1, 2)
+        order_axes = [axis, other[0], other[1]]        # x's spatial dims are in this order
+        back = [order_axes.index(a) for a in (0, 1, 2)]
+        out = x.permute(0, 1 + back[0], 1 + back[1], 1 + back[2]).contiguous()
+    elif eff_order >= 2:                               # order>=2 data: 3-D cubic B-spline (matches scipy order=3)
+        out = _gpu_cubic_resample(t, new_shape, axes=(0, 1, 2))
+    else:
+        m = "nearest" if eff_order == 0 else "trilinear"
+        x = t.unsqueeze(0)
+        out = (F.interpolate(x, size=tuple(new_shape), mode="nearest") if m == "nearest"
+               else F.interpolate(x, size=tuple(new_shape), mode="trilinear", align_corners=False)).squeeze(0)
+    return out
 
 
 if __name__ == '__main__':

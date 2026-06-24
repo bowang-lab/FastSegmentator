@@ -3,10 +3,57 @@ from typing import List
 # Hello! crop_to_nonzero is the function you are looking for. Ignore the rest.
 import cupy as cp
 import torch
+import nibabel as nib
 from cupyx.scipy import ndimage
 from scipy.ndimage import binary_fill_holes
 from nnunetv2.utilities.utils import log_runtime
 from acvl_utils.cropping_and_padding.bounding_boxes import get_bbox_from_mask as get_bbox_from_mask_cpu
+
+
+def _crop_dev():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def crop_to_mask_gpu(img_in: "nib.Nifti1Image", mask_img: "nib.Nifti1Image",
+                     addon=(0, 0, 0), dtype=None):
+    """GPU/torch port of totalsegmentator.cropping.crop_to_mask.
+
+    The bbox is computed with torch.any reductions on GPU (vs np.where on CPU in
+    get_bbox_from_mask) — identical min/max indices, identical mm→voxel addon and
+    clamping. Returns (cropped nib.Nifti1Image, bbox) exactly like the original.
+    """
+    dev = _crop_dev()
+    # ascontiguousarray: nibabel canonical/undo views can have negative strides, which
+    # torch.as_tensor rejects.
+    mask_t = torch.as_tensor(np.ascontiguousarray(mask_img.dataobj), device=dev)
+    addon_vox = (np.array(addon) / img_in.header.get_zooms()).astype(int)  # mm → voxels
+    s = mask_t.shape
+    nz = mask_t > 0                                          # get_bbox_from_mask outside_value=0
+    if not bool(nz.any()):
+        bbox = [[0, int(s[0])], [0, int(s[1])], [0, int(s[2])]]
+    else:
+        bbox = []
+        for ax in range(3):
+            proj = torch.any(nz, dim=tuple(d for d in range(3) if d != ax))
+            idx = torch.nonzero(proj, as_tuple=False).flatten()
+            lo = int(idx[0]) - int(addon_vox[ax])
+            hi = int(idx[-1]) + 1 + int(addon_vox[ax])
+            bbox.append([max(0, lo), min(int(s[ax]), hi)])
+    data = torch.as_tensor(np.ascontiguousarray(img_in.get_fdata()), device=dev)
+    cropped = data[bbox[0][0]:bbox[0][1], bbox[1][0]:bbox[1][1], bbox[2][0]:bbox[2][1]]
+    affine = np.copy(img_in.affine)
+    affine[:3, 3] = np.dot(affine, np.array([bbox[0][0], bbox[1][0], bbox[2][0], 1.0]))[:3]
+    dt = img_in.dataobj.dtype if dtype is None else dtype
+    return nib.Nifti1Image(cropped.cpu().numpy().astype(dt), affine), bbox
+
+
+def undo_crop_gpu(img: "nib.Nifti1Image", ref_img: "nib.Nifti1Image", bbox):
+    """GPU/torch port of totalsegmentator.cropping.undo_crop (zero-fill ref-shaped array)."""
+    dev = _crop_dev()
+    out = torch.zeros(tuple(ref_img.shape), device=dev, dtype=torch.float64)
+    cropped = torch.as_tensor(np.ascontiguousarray(img.get_fdata()), device=dev)
+    out[bbox[0][0]:bbox[0][1], bbox[1][0]:bbox[1][1], bbox[2][0]:bbox[2][1]] = cropped
+    return nib.Nifti1Image(out.cpu().numpy(), ref_img.affine)
 
 # Assume you have a binary array 'mask' on the GPU
 def create_nonzero_mask(data):

@@ -1,0 +1,8 @@
+mode,n,mean_dsc,new_s,official_s,speedup,gate
+liver_lesions,10,0.9609718495238152,44.8,280.8,6.26,FAIL
+liver_vessels,10,0.9880967632356054,33.6,277.3,8.26,FAIL
+liver_lesions_mr,10,0.9212405221301682,23.9,223.1,9.32,FAIL
+lung_nodules,10,0.9682701340963341,14.5,191.0,13.17,FAIL
+pleural_pericard_effusion,10,0.9542325341934657,10.2,146.8,14.42,FAIL
+lung_vessels_LEGACY,10,0.8550575966216861,11.8,170.0,14.37,FAIL
+liver_segments_mr,10,0.9722021146552867,18.1,202.9,11.24,FAIL

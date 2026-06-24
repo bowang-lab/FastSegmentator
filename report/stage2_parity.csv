@@ -1,0 +1,16 @@
+mode,n,mean_dsc,new_s,official_s,speedup,gate
+abdominal_muscles,3,0.9987669696532038,63.1,196.7,3.12,PASS
+kidney_cysts,3,nan,25.6,90.5,3.53,N/A (empty)
+liver_segments,3,0.9987802123772845,24.8,87.9,3.55,PASS
+liver_lesions,3,0.6209009787420853,28.5,100.5,3.53,FAIL
+liver_vessels,3,0.8176991496623257,23.3,94.3,4.04,FAIL
+head_muscles,3,0.9988316404823644,25.5,92.8,3.64,PASS
+headneck_bones_vessels,3,0.9982491578691826,31.1,105.4,3.39,PASS
+craniofacial_structures,3,0.9998968686019101,49.2,137.6,2.79,PASS
+oculomotor_muscles,3,0.9958664353166418,39.7,135.7,3.42,PASS
+lung_vessels,3,0.6660986288717429,11.3,70.2,6.2,FAIL
+lung_vessels_LEGACY,3,0.8469676188603134,13.2,59.6,4.51,FAIL
+lung_nodules,0,nan,0,0,nan,ERROR (CalledProcessError)
+pleural_pericard_effusion,3,0.8416285740809393,10.6,59.4,5.6,FAIL
+liver_segments_mr,3,0.9308014683949657,17.7,71.9,4.07,FAIL
+liver_lesions_mr,3,0.9613180047793941,17.6,75.1,4.27,FAIL

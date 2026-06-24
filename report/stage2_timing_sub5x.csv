@@ -1,0 +1,11 @@
+mode,n,mean_dsc,new_s,official_s,speedup,gate
+body,10,0.9996421558925459,87.9,204.6,2.33,PASS
+head_glands_cavities,10,0.9987190449568015,60.8,305.1,5.02,PASS
+headneck_muscles,10,0.9945261356598915,94.6,461.4,4.88,FAIL
+craniofacial_structures,10,0.9998152808692359,104.6,418.7,4.0,PASS
+abdominal_muscles,10,0.998131594712518,121.3,553.2,4.56,PASS
+headneck_bones_vessels,10,0.9967903889213231,73.3,332.9,4.54,PASS
+liver_segments,10,0.9983823360764756,48.0,249.1,5.19,PASS
+kidney_cysts,10,0.9919395947495858,50.6,247.3,4.88,FAIL
+head_muscles,10,0.9988817553810714,59.0,298.3,5.06,PASS
+oculomotor_muscles,10,0.995994136652239,88.1,421.4,4.78,PASS

@@ -1,0 +1,2 @@
+mode,n,mean_dsc,new_s,official_s,speedup,gate
+lung_vessels,10,0.9913426922646733,18.5,147.3,7.95,FAIL

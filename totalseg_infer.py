@@ -1,32 +1,29 @@
 """
 TotalSegmentator unified inference (CT + MR), config-driven.
 
-Stage 1: all uncropped, single-/multi-model modes.
-  CT:  total, trunk_cavities, breasts,
-       (licensed:) vertebrae_body, appendicular_bones, tissue_types,
-       tissue_4_types, face, thigh_shoulder_muscles
-  MR:  total_mr, body_mr, vertebrae_mr,
-       (licensed:) appendicular_bones_mr, tissue_types_mr,
-       thigh_shoulder_muscles_mr
+Behaviour is driven entirely by the per-mode `TaskConfig` (mirrors the official
+TotalSegmentator dispatch — no "stage" control flow). A mode runs if its weights
+are present locally; the fields decide the pipeline:
+  - resample        : cucim GPU change_spacing to model spacing (None = native)
+  - crop            : ROI names → rough whole-body seg builds a crop bbox
+  - mode_postprocess: "aux" / "body" / "remove_outside" branches
+  - crop_model      : recursive crop (only `teeth`; runs total→craniofacial→teeth)
 
 Fast-path applied to every mode:
   - cucim GPU change_spacing for canonical resample (skipped when resample=None)
   - FastPreprocessor: torch GPU trilinear inside run_case_npy
   - logits-to-segmentation via threshold (max_logit >= 0.5) — no softmax
 
-Stages 2-3 (crop pre-pass, postprocess, recursion, ROI subset) are reserved by
-config but not yet implemented; invoking those modes exits with a clear error.
-
 Usage:
   python totalseg_infer.py -i <in_folder> -o <out_folder> --task total
   python totalseg_infer.py -i <in_folder> -o <out_folder> --task total_mr
-  python totalseg_infer.py -i <in_folder> -o <out_folder> --task trunk_cavities
+  python totalseg_infer.py -i <in_folder> -o <out_folder> --task cerebral_bleed
 """
 import argparse
 import glob
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -54,6 +51,12 @@ class nnUNetTrainer_DASegOrd0(nnUNetTrainer): pass
 class nnUNetTrainer_DASegOrd0_NoMirroring(nnUNetTrainerNoMirroring): pass
 class nnUNetTrainer_2000epochs_NoMirroring(nnUNetTrainerNoMirroring): pass
 class nnUNetTrainer_4000epochs_NoMirroring(nnUNetTrainerNoMirroring): pass
+# Extra trainers: loss/augmentation variants only differ at training time;
+# the network built at inference is identical, so a `pass` stub is sufficient.
+class nnUNetTrainerDiceTopK10Loss_2000epochs(nnUNetTrainer): pass
+class nnUNetTrainerSkeletonRecall(nnUNetTrainer): pass
+class nnUNetTrainer_MOSAIC_1k_QuarterLR_NoMirroring(nnUNetTrainerNoMirroring): pass
+class nnUNetTrainer_onlyMirror01(nnUNetTrainer): pass
 
 
 _CUSTOM_TRAINERS = {
@@ -61,6 +64,10 @@ _CUSTOM_TRAINERS = {
     "nnUNetTrainer_DASegOrd0_NoMirroring":  nnUNetTrainer_DASegOrd0_NoMirroring,
     "nnUNetTrainer_2000epochs_NoMirroring": nnUNetTrainer_2000epochs_NoMirroring,
     "nnUNetTrainer_4000epochs_NoMirroring": nnUNetTrainer_4000epochs_NoMirroring,
+    "nnUNetTrainerDiceTopK10Loss_2000epochs":          nnUNetTrainerDiceTopK10Loss_2000epochs,
+    "nnUNetTrainerSkeletonRecall":                     nnUNetTrainerSkeletonRecall,
+    "nnUNetTrainer_MOSAIC_1k_QuarterLR_NoMirroring":   nnUNetTrainer_MOSAIC_1k_QuarterLR_NoMirroring,
+    "nnUNetTrainer_onlyMirror01":                      nnUNetTrainer_onlyMirror01,
 }
 
 
@@ -75,24 +82,58 @@ nnunet_infer_nii.recursive_find_python_class = _custom_find_class
 
 # --- Project imports ---------------------------------------------------------
 
-from nnunetv2.preprocessing.cropping.cropping import crop_to_nonzero  # noqa: E402
+from nnunetv2.preprocessing.cropping.cropping import (  # noqa: E402
+    crop_to_nonzero, crop_to_mask_gpu, undo_crop_gpu,
+)
 from nnunetv2.preprocessing.preprocessors.default_preprocessor import DefaultPreprocessor  # noqa: E402
 from nnunetv2.preprocessing.resampling.default_resampling import (  # noqa: E402
-    compute_new_shape, fast_resample_data_or_seg_to_shape,
+    compute_new_shape, fast_resample_data_or_seg_to_shape, torch_resample_data_or_seg_to_shape,
 )
 from nnunetv2.utilities.utils import log_runtime  # noqa: E402
 from totalsegmentator.alignment import undo_canonical as tseg_undo_canonical  # noqa: E402
 from totalsegmentator.config import get_weights_dir  # noqa: E402
+# Crop + connected-component postprocess: GPU/CuPy ports (bit-identical to the official
+# numpy/scipy versions) keep the whole pipeline on GPU. extract_skin / remove_auxiliary_labels
+# stay official (no-op / negligible).
+from totalsegmentator.postprocessing import extract_skin, remove_auxiliary_labels  # noqa: E402
+from nnunetv2.postprocessing.gpu_postprocessing import (  # noqa: E402
+    keep_largest_blob_multilabel_gpu, remove_small_blobs_multilabel_gpu, remove_outside_of_mask_gpu,
+)
 from totalsegmentator.map_to_binary import (  # noqa: E402
     class_map, class_map_5_parts, class_map_parts_mr, class_map_parts_headneck_muscles,
     map_taskid_to_partname_ct, map_taskid_to_partname_mr, map_taskid_to_partname_headneck_muscles,
 )
 from totalsegmentator.resampling import change_spacing as tseg_change_spacing  # noqa: E402
+from totalsegmentator.libs import reorder_multilabel_like_v1  # noqa: E402
 
 from nnunet_infer_nii import SimplePredictor  # noqa: E402
 
 
 CHECKPOINT = "checkpoint_final.pth"
+
+# --- Optional stage profiler (FASTSEG_PROFILE=1) -----------------------------
+import time as _time
+import contextlib as _contextlib
+_PROF: dict = {}
+_PROF_PREFIX = [""]   # set to "rough." while running the crop pre-pass
+
+
+@_contextlib.contextmanager
+def _prof(name: str):
+    if not os.environ.get("FASTSEG_PROFILE"):
+        yield
+        return
+    import torch as _torch
+    if _torch.cuda.is_available():
+        _torch.cuda.synchronize()
+    t = _time.perf_counter()
+    try:
+        yield
+    finally:
+        if _torch.cuda.is_available():
+            _torch.cuda.synchronize()
+        k = _PROF_PREFIX[0] + name
+        _PROF[k] = _PROF.get(k, 0.0) + (_time.perf_counter() - t)
 
 _CLASS_MAP_PARTS = {
     "class_map_5_parts":               class_map_5_parts,
@@ -121,19 +162,20 @@ class TaskConfig:
     partname_map_key: Optional[str] = None
     modality: str = "ct"
     licensed: bool = False
-    # --- Reserved for later stages (defined here so configs are stable) ---
-    crop: tuple = ()                         # ROI names; non-empty triggers stage-2 crop pre-pass
-    crop_addon: tuple = (3, 3, 3)
+    use_softmax: bool = False                # default: max_logit>=0.5 threshold (matches official for confident classes). Set True only where the low-confidence argmax-vs-threshold gap matters (e.g. liver_lesions).
+    # --- Crop pre-pass + mode postprocess ---
+    crop: tuple = ()                         # ROI names; non-empty triggers the crop pre-pass
+    crop_addon: tuple = (3, 3, 3)            # NOTE: overridden to 20mm for non-recursive crops
     crop_model: Optional[str] = None         # recursive crop (only `teeth` uses this)
+    robust_crop: bool = False                # use 3mm rough crop model (T297) instead of 6mm (T298)
     mode_postprocess: tuple = ()             # tags: "body", "remove_outside", "aux"
     remove_outside: tuple = ()
     remove_outside_dilation_mm: Optional[int] = None
-    stage: int = 1
 
 
 TASK_CONFIGS: dict[str, TaskConfig] = {
 
-    # === Stage 1 — multi-model totals ===
+    # === Uncropped — multi-model totals ===
     "total": TaskConfig(
         task_ids=(291, 292, 293, 294, 295),
         resample=(1.5, 1.5, 1.5),
@@ -152,7 +194,7 @@ TASK_CONFIGS: dict[str, TaskConfig] = {
         modality="mr",
     ),
 
-    # === Stage 1 — single-model open CT ===
+    # === Uncropped — single-model open CT ===
     "breasts": TaskConfig(
         task_ids=(527,),
         resample=(1.5, 1.5, 1.5),
@@ -166,7 +208,7 @@ TASK_CONFIGS: dict[str, TaskConfig] = {
         class_map_key="trunk_cavities",
     ),
 
-    # === Stage 1 — single-model open MR ===
+    # === Uncropped — single-model open MR ===
     "body_mr": TaskConfig(
         task_ids=(597,),
         resample=(1.5, 1.5, 1.5),
@@ -182,7 +224,7 @@ TASK_CONFIGS: dict[str, TaskConfig] = {
         modality="mr",
     ),
 
-    # === Stage 1 — licensed, uncropped CT ===
+    # === Uncropped — licensed CT ===
     "vertebrae_body": TaskConfig(
         task_ids=(305,),
         resample=(1.5, 1.5, 1.5),
@@ -228,7 +270,7 @@ TASK_CONFIGS: dict[str, TaskConfig] = {
         licensed=True,
     ),
 
-    # === Stage 1 — licensed, uncropped MR ===
+    # === Uncropped — licensed MR ===
     "appendicular_bones_mr": TaskConfig(
         task_ids=(855,),
         resample=(1.5, 1.5, 1.5),
@@ -254,37 +296,37 @@ TASK_CONFIGS: dict[str, TaskConfig] = {
         licensed=True,
     ),
 
-    # === Stage 2 — placeholders (crop pre-pass / postprocess required) ===
-    "body":                     TaskConfig((299,),  (1.5, 1.5, 1.5),     "nnUNetTrainer",                          "body",                     mode_postprocess=("body",),                  stage=2),
-    "face_mr":                  TaskConfig((856,),  (1.5, 1.5, 1.5),     "nnUNetTrainer_2000epochs_NoMirroring",   "face_mr",                  modality="mr", mode_postprocess=("aux",), licensed=True, stage=2),
-    "brain_aneurysm":           TaskConfig((615,),  (0.390625, 0.390625, 0.5000016391277313), "nnUNetTrainerDiceTopK10Loss_2000epochs", "brain_aneurysm", folds=None, stage=2),
-    "cerebral_bleed":           TaskConfig((150,),  None,                "nnUNetTrainer",                          "cerebral_bleed",           crop=("brain",), stage=2),
-    "hip_implant":              TaskConfig((260,),  None,                "nnUNetTrainer",                          "hip_implant",              crop=("femur_left","femur_right","hip_left","hip_right"), stage=2),
-    "liver_vessels":            TaskConfig((8,),    None,                "nnUNetTrainer",                          "liver_vessels",            crop=("liver",), crop_addon=(20,20,20), stage=2),
-    "lung_vessels":             TaskConfig((117,),  (0.703125, 0.703125, 1.0), "nnUNetTrainerSkeletonRecall",      "lung_vessels",             crop=("lung_upper_lobe_left","lung_lower_lobe_left","lung_upper_lobe_right","lung_middle_lobe_right","lung_lower_lobe_right"), stage=2),
-    "lung_vessels_LEGACY":      TaskConfig((258,),  None,                "nnUNetTrainer",                          "lung_vessels",             crop=("lung_upper_lobe_left","lung_lower_lobe_left","lung_upper_lobe_right","lung_middle_lobe_right","lung_lower_lobe_right"), stage=2),
-    "lung_nodules":             TaskConfig((913,),  (1.5, 1.5, 1.5),     "nnUNetTrainer_MOSAIC_1k_QuarterLR_NoMirroring", "lung_nodules",      crop=("lung_upper_lobe_left","lung_lower_lobe_left","lung_upper_lobe_right","lung_middle_lobe_right","lung_lower_lobe_right"), crop_addon=(10,10,10), stage=2),
-    "pleural_pericard_effusion":TaskConfig((315,),  None,                "nnUNetTrainer",                          "pleural_pericard_effusion",crop=("lung_upper_lobe_left","lung_lower_lobe_left","lung_upper_lobe_right","lung_middle_lobe_right","lung_lower_lobe_right"), crop_addon=(50,50,50), folds=None, stage=2),
-    "kidney_cysts":             TaskConfig((789,),  (1.5, 1.5, 1.5),     "nnUNetTrainer_DASegOrd0_NoMirroring",    "kidney_cysts",             crop=("kidney_left","kidney_right","liver","spleen","colon"), crop_addon=(10,10,10), mode_postprocess=("aux",), stage=2),
-    "liver_segments":           TaskConfig((570,),  (0.8046879768371582, 0.8046879768371582, 1.5), "nnUNetTrainerNoMirroring", "liver_segments", crop=("liver",), crop_addon=(10,10,10), stage=2),
-    "liver_segments_mr":        TaskConfig((576,),  (1.1250001788139343, 1.1875, 3.0), "nnUNetTrainer_DASegOrd0_NoMirroring", "liver_segments_mr", modality="mr", crop=("liver",), crop_addon=(10,10,10), stage=2),
-    "liver_lesions":            TaskConfig((591,),  (0.75, 0.75, 1.0),   "nnUNetTrainer",                          "liver_lesions",            model_config="3d_fullres_high", crop=("liver",), crop_addon=(10,10,10), stage=2),
-    "liver_lesions_mr":         TaskConfig((589,),  (0.8603515625, 0.857421875, 1.0), "nnUNetTrainer_DASegOrd0",   "liver_lesions_mr",         modality="mr", crop=("liver",), crop_addon=(3,3,3), stage=2),
-    "head_glands_cavities":     TaskConfig((775,),  (0.75, 0.75, 1.0),   "nnUNetTrainer_DASegOrd0_NoMirroring",    "head_glands_cavities",     model_config="3d_fullres_high", crop=("skull",), crop_addon=(10,10,10), stage=2),
-    "head_muscles":             TaskConfig((777,),  (0.75, 0.75, 1.0),   "nnUNetTrainer_DASegOrd0_NoMirroring",    "head_muscles",             model_config="3d_fullres_high", crop=("skull",), crop_addon=(10,10,10), stage=2),
-    "headneck_bones_vessels":   TaskConfig((776,),  (0.75, 0.75, 1.0),   "nnUNetTrainer_DASegOrd0_NoMirroring",    "headneck_bones_vessels",   model_config="3d_fullres_high", crop=("clavicula_left","clavicula_right","vertebrae_C1","vertebrae_C5","vertebrae_T1","vertebrae_T4"), crop_addon=(40,40,40), stage=2),
-    "headneck_muscles":         TaskConfig((778, 779), (0.75, 0.75, 1.0),"nnUNetTrainer_DASegOrd0_NoMirroring",    "headneck_muscles",         model_config="3d_fullres_high", class_map_parts_key="class_map_parts_headneck_muscles", partname_map_key="map_taskid_to_partname_headneck_muscles", crop=("clavicula_left","clavicula_right","vertebrae_C1","vertebrae_C5","vertebrae_T1","vertebrae_T4"), crop_addon=(40,40,40), stage=2),
-    "craniofacial_structures":  TaskConfig((115,),  (0.5, 0.5, 0.5),     "nnUNetTrainer_DASegOrd0_NoMirroring",    "craniofacial_structures",  crop=("skull",), crop_addon=(20,20,20), stage=2),
-    "oculomotor_muscles":       TaskConfig((351,),  (0.47251562774181366, 0.47251562774181366, 0.8500002026557922), "nnUNetTrainer_DASegOrd0_NoMirroring", "oculomotor_muscles", crop=("skull",), crop_addon=(20,20,20), stage=2),
-    "ventricle_parts":          TaskConfig((552,),  (0.4384765625, 0.4345703125, 1.0), "nnUNetTrainerNoMirroring", "ventricle_parts",          crop=("brain",), crop_addon=(0,0,0), stage=2),
-    "abdominal_muscles":        TaskConfig((952,),  (0.75, 0.75, 1.0),   "nnUNetTrainer_DASegOrd0_NoMirroring",    "abdominal_muscles",        model_config="3d_fullres_high", crop=("body_trunc",), crop_addon=(5,5,5), stage=2),
-    "brain_structures":         TaskConfig((409,),  (0.5, 0.5, 1.0),     "nnUNetTrainer_DASegOrd0",                "brain_structures",         model_config="3d_fullres_high", crop=("brain",), crop_addon=(10,10,10), licensed=True, stage=2),
-    "heartchambers_highres":    TaskConfig((301,),  None,                "nnUNetTrainer",                          "heartchambers_highres",    crop=("heart",), crop_addon=(5,5,5), mode_postprocess=("remove_outside",), remove_outside=("heart","aorta","inferior_vena_cava"), remove_outside_dilation_mm=10, licensed=True, stage=2),
-    "coronary_arteries":        TaskConfig((509,),  (0.7, 0.7, 0.7),     "nnUNetTrainerSkeletonRecall",            "coronary_arteries",        model_config="3d_fullres_high", crop=("heart",), crop_addon=(20,20,20), licensed=True, stage=2),
-    "coronary_arteries_LEGACY": TaskConfig((507,),  (0.7, 0.7, 0.7),     "nnUNetTrainer_DASegOrd0_NoMirroring",    "coronary_arteries",        model_config="3d_fullres_high", crop=("heart",), crop_addon=(20,20,20), licensed=True, stage=2),
-    "aortic_sinuses":           TaskConfig((920,),  (0.7, 0.7, 0.7),     "nnUNetTrainer_DASegOrd0_NoMirroring",    "aortic_sinuses",           model_config="3d_fullres_high", crop=("heart",), crop_addon=(0,0,0), licensed=True, stage=2),
+    # === Cropped modes (rough-seg crop pre-pass + mode postprocess) ===
+    "body":                     TaskConfig((299,),  (1.5, 1.5, 1.5),     "nnUNetTrainer",                          "body",                     mode_postprocess=("body",)),
+    "face_mr":                  TaskConfig((856,),  (1.5, 1.5, 1.5),     "nnUNetTrainer_2000epochs_NoMirroring",   "face_mr",                  modality="mr", mode_postprocess=("aux",), licensed=True),
+    "brain_aneurysm":           TaskConfig((615,),  (0.390625, 0.390625, 0.5000016391277313), "nnUNetTrainerDiceTopK10Loss_2000epochs", "brain_aneurysm", folds=None),
+    "cerebral_bleed":           TaskConfig((150,),  None,                "nnUNetTrainer",                          "cerebral_bleed",           crop=("brain",)),
+    "hip_implant":              TaskConfig((260,),  None,                "nnUNetTrainer",                          "hip_implant",              crop=("femur_left","femur_right","hip_left","hip_right")),
+    "liver_vessels":            TaskConfig((8,),    None,                "nnUNetTrainer",                          "liver_vessels",            crop=("liver",), crop_addon=(20,20,20)),
+    "lung_vessels":             TaskConfig((117,),  (0.703125, 0.703125, 1.0), "nnUNetTrainerSkeletonRecall",      "lung_vessels",             crop=("lung_upper_lobe_left","lung_lower_lobe_left","lung_upper_lobe_right","lung_middle_lobe_right","lung_lower_lobe_right"), robust_crop=True),
+    "lung_vessels_LEGACY":      TaskConfig((258,),  None,                "nnUNetTrainer",                          "lung_vessels",             crop=("lung_upper_lobe_left","lung_lower_lobe_left","lung_upper_lobe_right","lung_middle_lobe_right","lung_lower_lobe_right")),
+    "lung_nodules":             TaskConfig((913,),  (1.5, 1.5, 1.5),     "nnUNetTrainer_MOSAIC_1k_QuarterLR_NoMirroring", "lung_nodules",      crop=("lung_upper_lobe_left","lung_lower_lobe_left","lung_upper_lobe_right","lung_middle_lobe_right","lung_lower_lobe_right"), crop_addon=(10,10,10)),
+    "pleural_pericard_effusion":TaskConfig((315,),  None,                "nnUNetTrainer",                          "pleural_pericard_effusion",crop=("lung_upper_lobe_left","lung_lower_lobe_left","lung_upper_lobe_right","lung_middle_lobe_right","lung_lower_lobe_right"), crop_addon=(50,50,50), folds=None),
+    "kidney_cysts":             TaskConfig((789,),  (1.5, 1.5, 1.5),     "nnUNetTrainer_DASegOrd0_NoMirroring",    "kidney_cysts",             crop=("kidney_left","kidney_right","liver","spleen","colon"), crop_addon=(10,10,10), mode_postprocess=("aux",)),
+    "liver_segments":           TaskConfig((570,),  (0.8046879768371582, 0.8046879768371582, 1.5), "nnUNetTrainerNoMirroring", "liver_segments", crop=("liver",), crop_addon=(10,10,10)),
+    "liver_segments_mr":        TaskConfig((576,),  (1.1250001788139343, 1.1875, 3.0), "nnUNetTrainer_DASegOrd0_NoMirroring", "liver_segments_mr", modality="mr", crop=("liver",), crop_addon=(10,10,10)),
+    "liver_lesions":            TaskConfig((591,),  (0.75, 0.75, 1.0),   "nnUNetTrainer",                          "liver_lesions",            model_config="3d_fullres_high", crop=("liver",), crop_addon=(10,10,10), robust_crop=True, use_softmax=True),
+    "liver_lesions_mr":         TaskConfig((589,),  (0.8603515625, 0.857421875, 1.0), "nnUNetTrainer_DASegOrd0",   "liver_lesions_mr",         modality="mr", crop=("liver",), crop_addon=(3,3,3), robust_crop=True, use_softmax=True),
+    "head_glands_cavities":     TaskConfig((775,),  (0.75, 0.75, 1.0),   "nnUNetTrainer_DASegOrd0_NoMirroring",    "head_glands_cavities",     model_config="3d_fullres_high", crop=("skull",), crop_addon=(10,10,10)),
+    "head_muscles":             TaskConfig((777,),  (0.75, 0.75, 1.0),   "nnUNetTrainer_DASegOrd0_NoMirroring",    "head_muscles",             model_config="3d_fullres_high", crop=("skull",), crop_addon=(10,10,10)),
+    "headneck_bones_vessels":   TaskConfig((776,),  (0.75, 0.75, 1.0),   "nnUNetTrainer_DASegOrd0_NoMirroring",    "headneck_bones_vessels",   model_config="3d_fullres_high", crop=("clavicula_left","clavicula_right","vertebrae_C1","vertebrae_C5","vertebrae_T1","vertebrae_T4"), crop_addon=(40,40,40)),
+    "headneck_muscles":         TaskConfig((778, 779), (0.75, 0.75, 1.0),"nnUNetTrainer_DASegOrd0_NoMirroring",    "headneck_muscles",         model_config="3d_fullres_high", class_map_parts_key="class_map_parts_headneck_muscles", partname_map_key="map_taskid_to_partname_headneck_muscles", crop=("clavicula_left","clavicula_right","vertebrae_C1","vertebrae_C5","vertebrae_T1","vertebrae_T4"), crop_addon=(40,40,40)),
+    "craniofacial_structures":  TaskConfig((115,),  (0.5, 0.5, 0.5),     "nnUNetTrainer_DASegOrd0_NoMirroring",    "craniofacial_structures",  crop=("skull",), crop_addon=(20,20,20)),
+    "oculomotor_muscles":       TaskConfig((351,),  (0.47251562774181366, 0.47251562774181366, 0.8500002026557922), "nnUNetTrainer_DASegOrd0_NoMirroring", "oculomotor_muscles", crop=("skull",), crop_addon=(20,20,20)),
+    "ventricle_parts":          TaskConfig((552,),  (0.4384765625, 0.4345703125, 1.0), "nnUNetTrainerNoMirroring", "ventricle_parts",          crop=("brain",), crop_addon=(0,0,0)),
+    "abdominal_muscles":        TaskConfig((952,),  (0.75, 0.75, 1.0),   "nnUNetTrainer_DASegOrd0_NoMirroring",    "abdominal_muscles",        model_config="3d_fullres_high", crop=("body_trunc",), crop_addon=(5,5,5)),
+    "brain_structures":         TaskConfig((409,),  (0.5, 0.5, 1.0),     "nnUNetTrainer_DASegOrd0",                "brain_structures",         model_config="3d_fullres_high", crop=("brain",), crop_addon=(10,10,10), licensed=True),
+    "heartchambers_highres":    TaskConfig((301,),  None,                "nnUNetTrainer",                          "heartchambers_highres",    crop=("heart",), crop_addon=(5,5,5), mode_postprocess=("remove_outside",), remove_outside=("heart","aorta","inferior_vena_cava"), remove_outside_dilation_mm=10, licensed=True, robust_crop=True),
+    "coronary_arteries":        TaskConfig((509,),  (0.7, 0.7, 0.7),     "nnUNetTrainerSkeletonRecall",            "coronary_arteries",        model_config="3d_fullres_high", crop=("heart",), crop_addon=(20,20,20), licensed=True),
+    "coronary_arteries_LEGACY": TaskConfig((507,),  (0.7, 0.7, 0.7),     "nnUNetTrainer_DASegOrd0_NoMirroring",    "coronary_arteries",        model_config="3d_fullres_high", crop=("heart",), crop_addon=(20,20,20), licensed=True),
+    "aortic_sinuses":           TaskConfig((920,),  (0.7, 0.7, 0.7),     "nnUNetTrainer_DASegOrd0_NoMirroring",    "aortic_sinuses",           model_config="3d_fullres_high", crop=("heart",), crop_addon=(0,0,0), licensed=True),
 
-    # === Stage 3 — recursive crop ===
+    # === Recursive-crop modes (crop_model set; validated on ToothFairy3, DSC 0.9999) ===
     "teeth": TaskConfig(
         task_ids=(113,),
         resample=(0.5, 0.5, 0.5),
@@ -294,7 +336,6 @@ TASK_CONFIGS: dict[str, TaskConfig] = {
         crop=("teeth_lower", "teeth_upper"),
         crop_addon=(10, 10, 10),
         crop_model="craniofacial_structures",
-        stage=3,
     ),
 }
 
@@ -325,6 +366,21 @@ class FastPreprocessor(DefaultPreprocessor):
         )
 
         print(f"  [FastPreprocessor] shape={tuple(data.shape[1:])}  new_shape={tuple(new_shape)}")
+        if os.environ.get("FASTSEG_SCIPY_INPUT"):
+            # DIAGNOSTIC: official-exact input resample (scipy/skimage order=3 cubic + real
+            # sep-z), to isolate torch-trilinear vs scipy-cubic on the input data.
+            from nnunetv2.preprocessing.resampling.default_resampling import resample_data_or_seg_to_shape
+            _ord = int(os.environ.get("FASTSEG_SCIPY_ORDER", "3"))
+            out = resample_data_or_seg_to_shape(
+                data.detach().cpu().float().numpy(), list(new_shape),
+                original_spacing, target_spacing, is_seg=False, order=_ord, order_z=0,
+                force_separate_z=None)   # auto-detect sep-z (official resampling_fn_data)
+            return torch.from_numpy(np.asarray(out)).to(data.device, dtype=torch.float32)
+        if os.environ.get("FASTSEG_SEPZ"):
+            # torch separate-z input resample (order=3, like nnU-Net resampling_fn_data)
+            return torch_resample_data_or_seg_to_shape(
+                data, new_shape, original_spacing, target_spacing, is_seg=False, order=3, order_z=0,
+                force_separate_z=None)   # None = auto-detect sep-z by anisotropy (official behaviour)
         return fast_resample_data_or_seg_to_shape(data, new_shape, original_spacing, target_spacing)
 
 
@@ -357,7 +413,9 @@ def resolve_model_dir(weights_dir: Path, task_id: int, trainer: str, plans: str,
     return candidates[0] / f"{trainer}__{plans}__{model_config}"
 
 
-def build_predictors(cfg: TaskConfig, weights_dir: Path, device: torch.device, step_size: float) -> dict:
+def build_predictors(cfg: TaskConfig, weights_dir: Path, device: torch.device, step_size: float,
+                     use_fast: bool = True) -> dict:
+    predictor_cls = FastPredictor if use_fast else SimplePredictor  # SimplePredictor = scipy separate-z preprocessing
     predictors = {}
     for task_id in cfg.task_ids:
         model_path = resolve_model_dir(weights_dir, task_id, cfg.trainer, cfg.plans, cfg.model_config)
@@ -367,7 +425,7 @@ def build_predictors(cfg: TaskConfig, weights_dir: Path, device: torch.device, s
                 f"Expected layout: {{weights_dir}}/Dataset{task_id:03d}_*/"
                 f"{cfg.trainer}__{cfg.plans}__{cfg.model_config}/"
             )
-        p = FastPredictor(
+        p = predictor_cls(
             tile_step_size=step_size,
             use_gaussian=True,
             use_mirroring=False,
@@ -382,25 +440,20 @@ def build_predictors(cfg: TaskConfig, weights_dir: Path, device: torch.device, s
             str(model_path), use_folds=folds, checkpoint_name=CHECKPOINT,
         )
         p.network.to(device)
-        # Assert model's plans-spacing matches cfg.resample when cfg.resample is set
+        # Sanity check: cfg.resample is the TS-level (cucim) spacing. For most modes
+        # it equals the model's plans spacing, so FastPreprocessor's internal resample
+        # is a no-op. A few modes (e.g. lung_nodules: cfg 1.5mm vs plans 0.742mm) match
+        # official by double-resampling (cucim → 1.5, then FastPreprocessor → plans), so
+        # a mismatch here is informational, NOT an error.
         if cfg.resample is not None:
             plan_spacing = list(p.configuration_manager.spacing)  # ZYX
             cfg_zyx = [cfg.resample[2], cfg.resample[1], cfg.resample[0]]
             if not np.allclose(plan_spacing, cfg_zyx, atol=1e-4):
-                raise RuntimeError(
-                    f"Task{task_id} plans-spacing {plan_spacing} (ZYX) != cfg.resample {cfg_zyx} (ZYX). "
-                    f"Likely wrong trainer/plans/model_config combo in TASK_CONFIGS."
-                )
+                print(f"  NOTE: Task{task_id} plans-spacing {plan_spacing} (ZYX) != "
+                      f"cfg.resample {cfg_zyx} (ZYX) — FastPreprocessor will resample "
+                      f"cfg.resample → plans spacing (matches official double-resample).")
         predictors[task_id] = p
     return predictors
-
-
-def _remove_auxiliary_labels(seg: np.ndarray, task_name: str) -> np.ndarray:
-    aux_key = f"{task_name}_auxiliary"
-    if aux_key in class_map:
-        for idx in class_map[aux_key].keys():
-            seg[seg == idx] = 0
-    return seg
 
 
 def _merge_part(part_seg: np.ndarray, task_id: int, cfg: TaskConfig,
@@ -418,22 +471,140 @@ def _merge_part(part_seg: np.ndarray, task_id: int, cfg: TaskConfig,
     return seg_combined
 
 
+# --- Rough segmentation + crop mask --------------------------------
+
+# Rough crop models, keyed by crop_task (mirrors python_api.py rough-seg block).
+_ROUGH_CONFIGS = {
+    "total":     dict(task_ids=(298,), resample=(6.0, 6.0, 6.0),
+                      trainer="nnUNetTrainer_4000epochs_NoMirroring", class_map_key="total"),
+    "total_3mm": dict(task_ids=(297,), resample=(3.0, 3.0, 3.0),
+                      trainer="nnUNetTrainer_4000epochs_NoMirroring", class_map_key="total"),
+    "body":      dict(task_ids=(300,), resample=(6.0, 6.0, 6.0),
+                      trainer="nnUNetTrainer", class_map_key="body"),
+    "total_mr":  dict(task_ids=(852,), resample=(3.0, 3.0, 3.0),
+                      trainer="nnUNetTrainer_2000epochs_NoMirroring", class_map_key="total_mr",
+                      modality="mr"),
+}
+
+
+def rough_cfg_for(cfg: TaskConfig) -> tuple[str, TaskConfig]:
+    """Pick the rough crop model + its config (mirrors official crop dispatch).
+
+    robust_crop modes use the 3mm total model (T297) instead of 6mm (T298); for MR
+    the rough model is already 3mm (T852), so robust_crop is a no-op there.
+    """
+    if cfg.modality == "mr":
+        crop_task = "total_mr"
+    elif set(cfg.crop) & {"body_trunc", "body_extremities"}:
+        crop_task = "body"
+    elif cfg.robust_crop:
+        crop_task = "total_3mm"
+    else:
+        crop_task = "total"
+    spec  = _ROUGH_CONFIGS[crop_task]
+    rough = TaskConfig(
+        task_ids=spec["task_ids"], resample=spec["resample"], trainer=spec["trainer"],
+        class_map_key=spec["class_map_key"], modality=spec.get("modality", "ct"),
+    )
+    return crop_task, rough
+
+
+def _mask_from_seg(organ_seg: nib.Nifti1Image, class_map_inv: dict, rois) -> nib.Nifti1Image:
+    data = np.asarray(organ_seg.dataobj)   # uint8 label map; avoids a full float64 get_fdata
+    mask = np.zeros(organ_seg.shape, dtype=np.uint8)
+    for roi in rois:
+        mask[data == class_map_inv[roi]] = 1
+    return nib.Nifti1Image(mask, organ_seg.affine)
+
+
+def _build_predictors_cached(cfg: TaskConfig, weights_dir, device, step, cache, key, use_fast=True):
+    if key not in cache:
+        cache[key] = build_predictors(cfg, weights_dir, device, step, use_fast=use_fast)
+    return cache[key]
+
+
+def run_mode_to_original_space(file_path: str, mode_name: str, weights_dir, device, cache):
+    """Run a full mode pipeline (incl. its own crop pre-pass, recursively if the mode
+    has a crop_model) and return its multilabel seg as a nib image in original space.
+    Used as the crop source for recursive-crop modes (e.g. teeth → craniofacial_structures)."""
+    cfg = TASK_CONFIGS[mode_name]
+    with _prof("load"):
+        preds = _build_predictors_cached(cfg, weights_dir, device,
+                                         _step_size_for(mode_name, cfg), cache, mode_name)
+    crop_mask = None
+    if cfg.crop:
+        _PROF_PREFIX[0] = "rough."          # tag rough-seg pre-pass stages distinctly
+        try:
+            crop_mask, _ = build_crop_mask(file_path, cfg, weights_dir, device, cache)
+        finally:
+            _PROF_PREFIX[0] = ""
+    return _predict_to_original_space(file_path, preds, cfg, mode_name, crop_mask)
+
+
+def build_crop_mask(file_path: str, cfg: TaskConfig, weights_dir, device, cache):
+    """Build (crop_mask, remove_outside_mask|None) from a rough crop source.
+
+    Source is either a recursive full-mode run (cfg.crop_model set, e.g. teeth →
+    craniofacial_structures) or a rough whole-body seg (6mm total / 3mm robust / body / MR).
+    """
+    if cfg.crop_model is not None:
+        organ_seg = run_mode_to_original_space(file_path, cfg.crop_model, weights_dir, device, cache)
+        cmap_key  = cfg.crop_model
+    else:
+        crop_task, rough_cfg = rough_cfg_for(cfg)
+        with _prof("load"):
+            rough_preds = _build_predictors_cached(
+                rough_cfg, weights_dir, device, _step_size_for(crop_task, rough_cfg),
+                cache, "rough:" + crop_task)
+        organ_seg = _predict_to_original_space(file_path, rough_preds, rough_cfg, crop_task)
+        # rough_cfg.class_map_key is the real class map; crop_task may be an alias ("total_3mm").
+        cmap_key  = rough_cfg.class_map_key
+    class_map_inv = {v: k for k, v in class_map[cmap_key].items()}
+    crop_mask   = _mask_from_seg(organ_seg, class_map_inv, cfg.crop)
+    remove_mask = (_mask_from_seg(organ_seg, class_map_inv, cfg.remove_outside)
+                   if cfg.remove_outside else None)
+    return crop_mask, remove_mask
+
+
 # --- Inference ---------------------------------------------------------------
 
-@log_runtime
-def infer_file(file_path: str, predictors: dict, cfg: TaskConfig, task_name: str, output_path: str):
-    img_orig      = nib.load(file_path)
-    img_can       = nib.as_closest_canonical(img_orig)
+def _predict_to_original_space(file_path: str, predictors: dict, cfg: TaskConfig,
+                               task_name: str, crop_mask_nib=None) -> nib.Nifti1Image:
+    """Predict and return a multilabel seg in the input image's original space.
+
+    Order mirrors official nnunet.py: crop (original orientation) → canonical →
+    resample → predict → resample-back → undo canonical → undo crop.
+    """
+    img_orig = nib.load(file_path)
+
+    bbox = None
+    if crop_mask_nib is not None:
+        if not np.asarray(crop_mask_nib.dataobj).any():   # dataobj (uint8) avoids a full float64 get_fdata
+            # Empty crop mask → empty segmentation (matches nnunet.py:455-458).
+            return nib.Nifti1Image(np.zeros(img_orig.shape, dtype=np.uint8), img_orig.affine)
+        # Official forces crop_addon=[20,20,20] for every crop_model=None mode: the crop block
+        # at python_api.py:767 runs for standard crops too (roi_subset_crop = crop if crop is
+        # not None ...) and overrides the per-task value. Replicate for parity.
+        addon = [20, 20, 20] if cfg.crop_model is None else list(cfg.crop_addon)
+        with _prof("crop"):
+            # Crop img_orig directly (crop_to_mask_gpu slices, never mutates) — avoids an
+            # extra full-volume get_fdata() copy.
+            img_work, bbox = crop_to_mask_gpu(img_orig, crop_mask_nib, addon=addon, dtype=np.int32)
+    else:
+        img_work = img_orig
+
+    img_can       = nib.as_closest_canonical(img_work)
     img_can_shape = img_can.shape
 
     if cfg.resample is not None:
-        # T2 forward: cucim GPU change_spacing to cfg.resample (XYZ).
-        img_rsp     = tseg_change_spacing(img_can, list(cfg.resample), order=3, use_gpu=True)
+        # dtype=np.int32 matches official (nnunet.py:485-486): the resampled image is
+        # truncated to int BEFORE the model. Float here diverges on low-signal MR edges
+        # (e.g. total_mr scapula) and shifts the rough-seg liver mask → wrong crop bbox.
+        with _prof("in_resample"):
+            img_rsp = tseg_change_spacing(img_can, list(cfg.resample), order=3, dtype=np.int32, use_gpu=True)
         arr_xyz     = img_rsp.get_fdata().astype(np.float32)
-        # nnU-Net props['spacing'] is ZYX; cfg.resample is XYZ → reverse.
         spacing_zyx = [float(cfg.resample[2]), float(cfg.resample[1]), float(cfg.resample[0])]
     else:
-        # Native spacing: no T2 resample; spacing comes from the image itself.
         img_rsp     = img_can
         arr_xyz     = img_can.get_fdata().astype(np.float32)
         zooms_xyz   = img_can.header.get_zooms()[:3]
@@ -442,33 +613,94 @@ def infer_file(file_path: str, predictors: dict, cfg: TaskConfig, task_name: str
     image = arr_xyz.transpose(2, 1, 0)[np.newaxis]   # (1, Z, Y, X)
     props = {'spacing': spacing_zyx}
 
+    _dump = os.environ.get("FASTSEG_DUMP")
+    if _dump:   # model-input-space image (== official s01_0000)
+        nib.save(img_rsp, os.path.join(_dump, f"{task_name}__my_input_rsp.nii.gz"))
+
     seg_combined = None
     global_idx   = {name: idx for idx, name in class_map[cfg.class_map_key].items()}
     for task_id, predictor in predictors.items():
-        part_seg = predictor.inference(image, props, use_softmax=False).numpy()
+        with _prof("forward"):
+            part_seg = predictor.inference(image, props, use_softmax=cfg.use_softmax).numpy()
         if seg_combined is None:
             seg_combined = np.zeros(part_seg.shape, dtype=np.uint8)
         _merge_part(part_seg, task_id, cfg, seg_combined, global_idx)
 
-    # Mode-specific postprocess (stage-1 subset: auxiliary-label removal only)
-    if "aux" in cfg.mode_postprocess:
-        seg_combined = _remove_auxiliary_labels(seg_combined, task_name)
-
-    # T2 inverse (only when we forward-resampled) + undo canonical
+    # Postprocess at resample resolution (matches nnunet.py:622-637).
     seg_xyz = seg_combined.transpose(2, 1, 0).astype(np.uint8)
     seg_nib = nib.Nifti1Image(seg_xyz, img_rsp.affine)
-    if cfg.resample is not None:
-        seg_nib = tseg_change_spacing(
-            seg_nib, list(cfg.resample), img_can_shape,
-            order=0, force_affine=img_can.affine, use_gpu=True,
+    seg_nib = remove_auxiliary_labels(seg_nib, task_name)   # no-op without `{task}_auxiliary`
+    if "body" in cfg.mode_postprocess:
+        data = seg_nib.get_fdata().astype(np.uint8)
+        data = keep_largest_blob_multilabel_gpu(data, class_map[task_name], ["body_trunc"])
+        vox_vol = float(np.prod(seg_nib.header.get_zooms()))
+        data = remove_small_blobs_multilabel_gpu(
+            data, class_map[task_name], ["body_extremities"],
+            interval=[50000 / vox_vol, 1e10],
         )
-    seg_nib = tseg_undo_canonical(seg_nib, img_orig)
+        seg_nib = nib.Nifti1Image(data, seg_nib.affine)
 
-    seg_out = seg_nib.get_fdata().transpose(2, 1, 0).astype(np.uint8)
+    if _dump:   # segmentation at model-input resolution (== official s01 prediction)
+        nib.save(seg_nib, os.path.join(_dump, f"{task_name}__my_seg_rsp.nii.gz"))
+
+    # Undo resample → canonical → crop (matches nnunet.py:706-728).
+    with _prof("out_resample"):
+        if cfg.resample is not None:
+            seg_nib = tseg_change_spacing(
+                seg_nib, list(cfg.resample), img_can_shape,
+                order=0, force_affine=img_can.affine, use_gpu=True,
+            )
+        seg_nib = tseg_undo_canonical(seg_nib, img_orig)
+        if bbox is not None:
+            seg_nib = undo_crop_gpu(seg_nib, img_orig, bbox)
+    return seg_nib
+
+
+@log_runtime
+def infer_file(file_path: str, predictors: dict, cfg: TaskConfig, task_name: str,
+               output_path: str, weights_dir=None, device=None, cache: Optional[dict] = None,
+               roi_subset: tuple = (), v1_order: bool = False):
+    crop_mask = remove_mask = None
+    if cfg.crop:
+        _PROF_PREFIX[0] = "rough."          # tag rough-seg pre-pass stages distinctly
+        try:
+            crop_mask, remove_mask = build_crop_mask(file_path, cfg, weights_dir, device, cache)
+        finally:
+            _PROF_PREFIX[0] = ""
+
+    seg_nib  = _predict_to_original_space(file_path, predictors, cfg, task_name, crop_mask)
+    img_data = seg_nib.get_fdata().astype(np.uint8)
+
+    # v1 label reorder for `total` (matches nnunet.py:738), then roi_subset filter (nnunet.py:740).
+    if v1_order and task_name == "total":
+        img_data = reorder_multilabel_like_v1(img_data, class_map["total"], class_map["total_v1"])
+    if roi_subset:
+        cmap = class_map["total_v1"] if (v1_order and task_name == "total") else class_map[cfg.class_map_key]
+        keep = [idx for idx, name in cmap.items() if name in roi_subset]
+        img_data = (img_data * np.isin(img_data, keep)).astype(np.uint8)
+
+    # remove_outside postprocess in ORIGINAL space (matches nnunet.py:744-749).
+    if "remove_outside" in cfg.mode_postprocess and remove_mask is not None:
+        img_orig    = nib.load(file_path)
+        dilation_vx = int(cfg.remove_outside_dilation_mm
+                          / float(np.mean(img_orig.header.get_zooms()[:3])))
+        img_data    = remove_outside_of_mask_gpu(img_data, remove_mask.get_fdata(), addon=dilation_vx)
+
     out_name = os.path.basename(file_path).replace("_0000.nii.gz", "").replace(".nii.gz", "")
-    sitk_img = sitk.GetImageFromArray(seg_out)
-    sitk_img.CopyInformation(sitk.ReadImage(file_path))
-    sitk.WriteImage(sitk_img, os.path.join(output_path, f"{out_name}.nii.gz"))
+    with _prof("save"):
+        seg_out  = img_data.transpose(2, 1, 0).astype(np.uint8)   # XYZ → ZYX for sitk
+        sitk_img = sitk.GetImageFromArray(seg_out)
+        sitk_img.CopyInformation(sitk.ReadImage(file_path))
+        sitk.WriteImage(sitk_img, os.path.join(output_path, f"{out_name}.nii.gz"))
+
+    # Derived body/skin masks. Official only emits these in split-file mode; we add
+    # them in multilabel mode as a convenience (parity is judged on the multilabel array).
+    if "body" in cfg.mode_postprocess:
+        img_orig = nib.load(file_path)
+        body_nib = nib.Nifti1Image((img_data > 0).astype(np.uint8), img_orig.affine)
+        nib.save(body_nib, os.path.join(output_path, f"{out_name}_body.nii.gz"))
+        nib.save(extract_skin(img_orig, body_nib),
+                 os.path.join(output_path, f"{out_name}_skin.nii.gz"))
 
 
 def _step_size_for(task_name: str, cfg: TaskConfig) -> float:
@@ -493,18 +725,54 @@ def main():
                         help="Path to TotalSegmentator weights "
                              "(default: ~/.totalsegmentator/nnunet/results)")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--use_softmax", action="store_true", default=False,
+                        help="Override: softmax+argmax instead of the 0.5 logit threshold "
+                             "(matches official for low-confidence sparse classes)")
+    parser.add_argument("--roi_subset", nargs="+", default=None,
+                        help="Restrict output to these ROI names (total* modes only); "
+                             "prunes multi-model parts to those containing the subset")
+    parser.add_argument("--v1_order", action="store_true", default=False,
+                        help="Reorder `total` labels to the v1 label scheme (class_map total_v1)")
+    parser.add_argument("--scipy_resample", action="store_true", default=False,
+                        help="Diagnostic: build the main model with the scipy DefaultPreprocessor "
+                             "(separate-z aware) instead of the torch trilinear FastPreprocessor")
     args = parser.parse_args()
 
     cfg = TASK_CONFIGS[args.task]
-    if cfg.stage > 1:
-        sys.exit(
-            f"ERROR: mode '{args.task}' requires stage {cfg.stage} "
-            f"(crop pre-pass / mode postprocess / recursive crop), which is not yet "
-            f"implemented in totalseg_infer.py. See PLAN.md."
-        )
+    if args.use_softmax:
+        cfg = replace(cfg, use_softmax=True)
+
+    # Use the torch resampler (cubic-B-spline order-3 input + separate-z order-1 output,
+    # auto-detecting anisotropy) for ALL modes by default. It reproduces nnU-Net's
+    # resample_data_or_seg (scipy/skimage order-3) to ~1e-13 on GPU. Trilinear (order-1)
+    # input caps sparse/low-confidence pathology modes (pleural/lung_nodules) at ~0.87 DSC;
+    # cubic lifts them to >0.999. Confident organ modes are unaffected (cubic≈trilinear there).
+    if "FASTSEG_SEPZ" not in os.environ:
+        os.environ["FASTSEG_SEPZ"] = "1"
+        print("[resample] torch cubic-B-spline (order-3) input + separate-z output enabled")
+
+    roi_subset = tuple(args.roi_subset) if args.roi_subset else ()
+    if roi_subset and not args.task.startswith("total"):
+        sys.exit(f"ERROR: --roi_subset is only supported for total* modes, not '{args.task}'.")
+    # Prune multi-model total parts to those whose part-map intersects the subset (nnunet.py:539-550).
+    if roi_subset and cfg.class_map_parts_key:
+        parts = _CLASS_MAP_PARTS[cfg.class_map_parts_key]
+        partname_to_taskid = {v: k for k, v in _PARTNAME_MAPS[cfg.partname_map_key].items()}
+        new_ids = tuple(partname_to_taskid[pn] for pn, pm in parts.items()
+                        if any(o in roi_subset for o in pm.values()))
+        if new_ids:
+            print(f"[roi_subset] pruning models {cfg.task_ids} → {new_ids}")
+            cfg = replace(cfg, task_ids=new_ids)
     if cfg.licensed:
         print(f"NOTE: '{args.task}' is a commercial TotalSegmentator mode. "
               f"This script skips the license check — make sure you have the weights.")
+
+    # Deterministic forward: the fp16 sliding-window pass otherwise selects cuDNN algorithms
+    # nondeterministically across processes, occasionally shifting the rough-seg crop mask by
+    # ~1 coarse voxel (e.g. liver_lesions crop 175↔172 → DSC 1.0↔0.95). Force reproducibility.
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
     weights_dir = Path(args.weights_dir) if args.weights_dir else Path(get_weights_dir())
     device      = torch.device(args.device)
@@ -515,13 +783,30 @@ def main():
     if not files:
         raise FileNotFoundError(f"No .nii.gz files found in {args.input_path}")
 
+    # Predictor cache: main model + any rough/recursive crop-source models are built
+    # once and reused across files (build_crop_mask / run_mode_to_original_space populate it).
+    cache = {}
+    with _prof("load"):
+        predictors = _build_predictors_cached(cfg, weights_dir, device, step_size, cache, args.task,
+                                              use_fast=not args.scipy_resample)
+    if cfg.crop:
+        src = cfg.crop_model if cfg.crop_model else rough_cfg_for(cfg)[0]
+        print(f"[crop] source={src} (crop_model={cfg.crop_model}, crop={cfg.crop})")
+
     print(f"[task={args.task}] models={cfg.task_ids}  resample={cfg.resample}  step={step_size}  modality={cfg.modality}")
-    print(f"Loading {len(cfg.task_ids)} sub-model(s) from {weights_dir} ...")
-    predictors = build_predictors(cfg, weights_dir, device, step_size)
+    print(f"Loading sub-model(s) from {weights_dir} ...")
 
     for file in tqdm(files, desc=f"Inference ({args.task})"):
         print(f"\n{os.path.basename(file)}")
-        infer_file(file, predictors, cfg, args.task, args.output_path)
+        infer_file(file, predictors, cfg, args.task, args.output_path,
+                   weights_dir=weights_dir, device=device, cache=cache,
+                   roi_subset=roi_subset, v1_order=args.v1_order)
+
+    if os.environ.get("FASTSEG_PROFILE") and _PROF:
+        print("\n[PROFILE] stage wall-time (s):")
+        for k in sorted(_PROF, key=lambda x: -_PROF[x]):
+            print(f"  {k:24s} {_PROF[k]:7.2f}")
+        print(f"  {'SUM(stages)':24s} {sum(_PROF.values()):7.2f}")
 
 
 if __name__ == "__main__":

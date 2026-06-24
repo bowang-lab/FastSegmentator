@@ -1,0 +1,2 @@
+mode,n,mean_dsc,new_s,official_s,speedup,gate
+liver_lesions,10,0.9590260916563903,66.5,0.0,0.0,FAIL

@@ -94,7 +94,30 @@ def convert_predicted_logits_to_segmentation_with_correct_shape(
     target_shape = properties_dict['shape_after_cropping_and_before_resampling']
     original_spacing = [properties_dict['spacing'][i] for i in plans_manager.transpose_forward]
 
-    if target_shape[0] < 600:
+    if os.environ.get("FASTSEG_SEPZ"):
+        # torch separate-z output resample (order=1, like nnU-Net resampling_fn_probabilities)
+        from nnunetv2.preprocessing.resampling.default_resampling import torch_resample_data_or_seg_to_shape
+        predicted_logits = torch_resample_data_or_seg_to_shape(
+            predicted_logits, list(target_shape), current_spacing, original_spacing,
+            is_seg=False, order=1, order_z=0, force_separate_z=None)   # auto-detect sep-z
+        gc.collect(); empty_cache(predicted_logits.device)
+        if use_softmax:
+            segmentation = label_manager.convert_probabilities_to_segmentation(
+                label_manager.apply_inference_nonlin(predicted_logits))
+        else:
+            segmentation = logits_to_segmentation(predicted_logits)
+    elif os.environ.get("FASTSEG_SCIPY_OUTPUT"):
+        # Diagnostic: resample logits back with scipy separate-z (official nnU-Net path)
+        # instead of torch trilinear, to test whether output resampling drives parity gaps
+        # on anisotropic data.
+        from nnunetv2.preprocessing.resampling.default_resampling import resample_data_or_seg_to_shape
+        pl = predicted_logits.detach().cpu().float().numpy()
+        pl = resample_data_or_seg_to_shape(pl, list(target_shape), current_spacing, original_spacing, is_seg=False, order=1)  # order=1 = resampling_fn_probabilities (official)
+        predicted_logits = torch.from_numpy(np.asarray(pl))
+        segmentation = (label_manager.convert_probabilities_to_segmentation(
+                            label_manager.apply_inference_nonlin(predicted_logits))
+                        if use_softmax else logits_to_segmentation(predicted_logits))
+    elif target_shape[0] < 600:
         # Resample logits then convert to segmentation
         predicted_logits = fast_resample_logit_to_shape(
             predicted_logits, target_shape, current_spacing, original_spacing
@@ -363,19 +386,32 @@ def main():
     os.makedirs(output_folder, exist_ok=True)
     files = glob.glob(os.path.join(args.input_path, '*.nii.gz'))
 
+    failures = []
     for file in tqdm(files):
-        image, props = SimpleITKIO().read_images([file])
-        t0 = time()
-        seg = predictor.inference(image, props, args.use_softmax)
-        print(f'total: {time() - t0:.2f}s')
+        try:
+            image, props = SimpleITKIO().read_images([file])
+            t0 = time()
+            seg = predictor.inference(image, props, args.use_softmax)
+            print(f'total: {time() - t0:.2f}s')
 
-        sitk_img = sitk.GetImageFromArray(seg)
-        sitk_img.SetSpacing(props['sitk_stuff']['spacing'])
-        sitk_img.SetOrigin(props['sitk_stuff']['origin'])
-        sitk_img.SetDirection(props['sitk_stuff']['direction'])
+            sitk_img = sitk.GetImageFromArray(seg)
+            sitk_img.SetSpacing(props['sitk_stuff']['spacing'])
+            sitk_img.SetOrigin(props['sitk_stuff']['origin'])
+            sitk_img.SetDirection(props['sitk_stuff']['direction'])
 
-        case_name = os.path.basename(file).replace('_0000.nii.gz', '.nii.gz')
-        sitk.WriteImage(sitk_img, os.path.join(output_folder, case_name))
+            case_name = os.path.basename(file).replace('_0000.nii.gz', '.nii.gz')
+            sitk.WriteImage(sitk_img, os.path.join(output_folder, case_name))
+        except Exception as e:
+            # Don't let one bad case (e.g. a single-slice volume that a 3D model
+            # cannot resample) abort the whole batch — log it and move on.
+            failures.append(os.path.basename(file))
+            print(f'FAILED {os.path.basename(file)}: {type(e).__name__}: {e}')
+            empty_cache(device)
+
+    if failures:
+        print(f'\n{len(failures)} case(s) FAILED and were skipped:')
+        for f in failures:
+            print(f'  - {f}')
 
 
 if __name__ == "__main__":
