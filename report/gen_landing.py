@@ -190,7 +190,8 @@ TEMPLATE = r"""<!doctype html>
   tr:last-child td{border-bottom:none} .num{font-variant-numeric:tabular-nums;white-space:nowrap}
   code{background:#eef1f4;padding:1px 6px;border-radius:5px;font-size:13px}
   .pass{color:var(--g);font-weight:650}
-  .chartbox{background:#fff;border:1px solid var(--line);border-radius:12px;padding:18px;margin:14px 0}
+  .chartbox{background:#fff;border:1px solid var(--line);border-radius:12px;padding:14px 18px;margin:12px 0}
+  .cwrap{position:relative;width:100%}  /* Chart.js responsive needs a fixed-height box */
   .grid2{display:block}  /* single column — full-width tables & charts (no squished two-up) */
   .rtlegend{display:flex;flex-wrap:wrap;gap:6px 14px;justify-content:center;font-size:12.5px;color:#33414f;margin:6px 0 10px}
   .lg{display:inline-flex;align-items:center;gap:5px} .lg i{width:11px;height:11px;border-radius:3px;display:inline-block}
@@ -263,7 +264,7 @@ TEMPLATE = r"""<!doctype html>
     <div class="grid2">
       %%REQ_TABLE%%
       <div class="chartbox"><h3 style="margin:.2em 0 0;font-size:15px;color:#33414f">Peak GPU memory by mode (GB)</h3>
-        <canvas id="vramChart" height="180"></canvas></div>
+        <div class="cwrap" style="height:150px"><canvas id="vramChart"></canvas></div></div>
     </div>
   </section>
 
@@ -274,12 +275,12 @@ TEMPLATE = r"""<!doctype html>
       in batch the per-case cost collapses toward the forward-pass ratio.</p>
     <div class="grid2">
       <div class="chartbox"><h3 style="margin:.2em 0 0;font-size:15px;color:#33414f">Speedup vs official (×)</h3>
-        <canvas id="spdChart" height="300"></canvas></div>
+        <div class="cwrap" style="height:170px"><canvas id="spdChart"></canvas></div></div>
       <div class="chartbox"><h3 style="margin:.2em 0 0;font-size:15px;color:#33414f">Single-case runtime composition</h3>
         <div class="rtlegend">%%RT_LEGEND%%</div>
         <div class="pies">
-          <div><canvas id="rtChart0" height="170"></canvas><div class="cap">%%RT_CAP0%%</div></div>
-          <div><canvas id="rtChart1" height="170"></canvas><div class="cap">%%RT_CAP1%%</div></div>
+          <div><div class="cwrap" style="height:150px"><canvas id="rtChart0"></canvas></div><div class="cap">%%RT_CAP0%%</div></div>
+          <div><div class="cwrap" style="height:150px"><canvas id="rtChart1"></canvas></div><div class="cap">%%RT_CAP1%%</div></div>
         </div></div>
     </div>
     %%FWD_TABLE%%
@@ -296,9 +297,9 @@ TEMPLATE = r"""<!doctype html>
     %%PARITY_TABLE%%
     <div class="grid2">
       <div class="chartbox"><h3 style="margin:.2em 0 0;font-size:15px;color:#33414f">DSC by mode</h3>
-        <canvas id="dscChart" height="300"></canvas></div>
+        <div class="cwrap" style="height:170px"><canvas id="dscChart"></canvas></div></div>
       <div class="chartbox"><h3 style="margin:.2em 0 0;font-size:15px;color:#33414f">DSC vs speedup</h3>
-        <canvas id="scChart" height="240"></canvas></div>
+        <div class="cwrap" style="height:220px"><canvas id="scChart"></canvas></div></div>
     </div>
   </section>
 
@@ -307,7 +308,7 @@ TEMPLATE = r"""<!doctype html>
     <p class="lead">Three independent root causes were isolated by bisecting against official's
       per-function intermediates; each fix runs on GPU and lifted the hard modes to parity.</p>
     <div class="chartbox"><h3 style="margin:.2em 0 0;font-size:15px;color:#33414f">Before → after (DSC)</h3>
-      <canvas id="fixChart" height="200"></canvas></div>
+      <div class="cwrap" style="height:190px"><canvas id="fixChart"></canvas></div></div>
     %%FIX_TABLE%%
   </section>
 
@@ -334,7 +335,7 @@ TEMPLATE = r"""<!doctype html>
 const D = %%CHART_DATA%%;
 const baseBar = (horizontal)=>({indexAxis:horizontal?'y':'x',responsive:true,
   plugins:{legend:{display:false}},maintainAspectRatio:false});
-const catX = {ticks:{maxRotation:90,minRotation:90,font:{size:10},autoSkip:false}};
+const catX = {ticks:{display:false}};
 new Chart(spdChart,{type:'bar',data:{labels:D.spdLabels,
   datasets:[{data:D.spdVals,backgroundColor:'#1565c0'}]},
   options:{...baseBar(false),scales:{x:catX,y:{title:{display:true,text:'speedup vs official (×)'}}}}});
