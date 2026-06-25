@@ -9,10 +9,13 @@ are present locally; the fields decide the pipeline:
   - mode_postprocess: "aux" / "body" / "remove_outside" branches
   - crop_model      : recursive crop (only `teeth`; runs total→craniofacial→teeth)
 
-Fast-path applied to every mode:
+Fast-path applied to every mode (whole pipeline on GPU):
   - cucim GPU change_spacing for canonical resample (skipped when resample=None)
-  - FastPreprocessor: torch GPU trilinear inside run_case_npy
-  - logits-to-segmentation via threshold (max_logit >= 0.5) — no softmax
+  - FastPreprocessor: torch GPU order-3 cubic-B-spline resample (matches nnU-Net's
+    scipy order-3 to ~1e-13) inside run_case_npy
+  - GPU crop (crop_to_mask_gpu) + GPU connected-component postprocess
+  - logits-to-segmentation via threshold (max_logit >= 0.5) by default; per-mode
+    softmax-argmax (use_softmax) for low-confidence lesion modes
 
 Usage:
   python totalseg_infer.py -i <in_folder> -o <out_folder> --task total
@@ -87,8 +90,9 @@ from nnunetv2.preprocessing.cropping.cropping import (  # noqa: E402
 )
 from nnunetv2.preprocessing.preprocessors.default_preprocessor import DefaultPreprocessor  # noqa: E402
 from nnunetv2.preprocessing.resampling.default_resampling import (  # noqa: E402
-    compute_new_shape, fast_resample_data_or_seg_to_shape, torch_resample_data_or_seg_to_shape,
+    compute_new_shape, torch_resample_data_or_seg_to_shape,
 )
+from nnunetv2.utilities.helpers import empty_cache  # noqa: E402
 from nnunetv2.utilities.utils import log_runtime  # noqa: E402
 from totalsegmentator.alignment import undo_canonical as tseg_undo_canonical  # noqa: E402
 from totalsegmentator.config import get_weights_dir  # noqa: E402
@@ -110,30 +114,6 @@ from nnunet_infer_nii import SimplePredictor  # noqa: E402
 
 
 CHECKPOINT = "checkpoint_final.pth"
-
-# --- Optional stage profiler (FASTSEG_PROFILE=1) -----------------------------
-import time as _time
-import contextlib as _contextlib
-_PROF: dict = {}
-_PROF_PREFIX = [""]   # set to "rough." while running the crop pre-pass
-
-
-@_contextlib.contextmanager
-def _prof(name: str):
-    if not os.environ.get("FASTSEG_PROFILE"):
-        yield
-        return
-    import torch as _torch
-    if _torch.cuda.is_available():
-        _torch.cuda.synchronize()
-    t = _time.perf_counter()
-    try:
-        yield
-    finally:
-        if _torch.cuda.is_available():
-            _torch.cuda.synchronize()
-        k = _PROF_PREFIX[0] + name
-        _PROF[k] = _PROF.get(k, 0.0) + (_time.perf_counter() - t)
 
 _CLASS_MAP_PARTS = {
     "class_map_5_parts":               class_map_5_parts,
@@ -365,23 +345,11 @@ class FastPreprocessor(DefaultPreprocessor):
             plans_manager.foreground_intensity_properties_per_channel,
         )
 
-        print(f"  [FastPreprocessor] shape={tuple(data.shape[1:])}  new_shape={tuple(new_shape)}")
-        if os.environ.get("FASTSEG_SCIPY_INPUT"):
-            # DIAGNOSTIC: official-exact input resample (scipy/skimage order=3 cubic + real
-            # sep-z), to isolate torch-trilinear vs scipy-cubic on the input data.
-            from nnunetv2.preprocessing.resampling.default_resampling import resample_data_or_seg_to_shape
-            _ord = int(os.environ.get("FASTSEG_SCIPY_ORDER", "3"))
-            out = resample_data_or_seg_to_shape(
-                data.detach().cpu().float().numpy(), list(new_shape),
-                original_spacing, target_spacing, is_seg=False, order=_ord, order_z=0,
-                force_separate_z=None)   # auto-detect sep-z (official resampling_fn_data)
-            return torch.from_numpy(np.asarray(out)).to(data.device, dtype=torch.float32)
-        if os.environ.get("FASTSEG_SEPZ"):
-            # torch separate-z input resample (order=3, like nnU-Net resampling_fn_data)
-            return torch_resample_data_or_seg_to_shape(
-                data, new_shape, original_spacing, target_spacing, is_seg=False, order=3, order_z=0,
-                force_separate_z=None)   # None = auto-detect sep-z by anisotropy (official behaviour)
-        return fast_resample_data_or_seg_to_shape(data, new_shape, original_spacing, target_spacing)
+        # GPU order-3 cubic-B-spline input resample (separate-z auto-detected by anisotropy),
+        # matching nnU-Net's resampling_fn_data (scipy order-3) to ~1e-13.
+        return torch_resample_data_or_seg_to_shape(
+            data, new_shape, original_spacing, target_spacing, is_seg=False, order=3, order_z=0,
+            force_separate_z=None)
 
 
 class FastPredictor(SimplePredictor):
@@ -513,6 +481,9 @@ def _mask_from_seg(organ_seg: nib.Nifti1Image, class_map_inv: dict, rois) -> nib
     data = np.asarray(organ_seg.dataobj)   # uint8 label map; avoids a full float64 get_fdata
     mask = np.zeros(organ_seg.shape, dtype=np.uint8)
     for roi in rois:
+        if roi not in class_map_inv:
+            raise KeyError(f"crop ROI '{roi}' not in the rough-seg class map "
+                           f"{sorted(class_map_inv)[:8]}... — check the crop config / rough model")
         mask[data == class_map_inv[roi]] = 1
     return nib.Nifti1Image(mask, organ_seg.affine)
 
@@ -528,16 +499,11 @@ def run_mode_to_original_space(file_path: str, mode_name: str, weights_dir, devi
     has a crop_model) and return its multilabel seg as a nib image in original space.
     Used as the crop source for recursive-crop modes (e.g. teeth → craniofacial_structures)."""
     cfg = TASK_CONFIGS[mode_name]
-    with _prof("load"):
-        preds = _build_predictors_cached(cfg, weights_dir, device,
-                                         _step_size_for(mode_name, cfg), cache, mode_name)
+    preds = _build_predictors_cached(cfg, weights_dir, device,
+                                     _step_size_for(mode_name, cfg), cache, mode_name)
     crop_mask = None
     if cfg.crop:
-        _PROF_PREFIX[0] = "rough."          # tag rough-seg pre-pass stages distinctly
-        try:
-            crop_mask, _ = build_crop_mask(file_path, cfg, weights_dir, device, cache)
-        finally:
-            _PROF_PREFIX[0] = ""
+        crop_mask, _ = build_crop_mask(file_path, cfg, weights_dir, device, cache)
     return _predict_to_original_space(file_path, preds, cfg, mode_name, crop_mask)
 
 
@@ -552,10 +518,9 @@ def build_crop_mask(file_path: str, cfg: TaskConfig, weights_dir, device, cache)
         cmap_key  = cfg.crop_model
     else:
         crop_task, rough_cfg = rough_cfg_for(cfg)
-        with _prof("load"):
-            rough_preds = _build_predictors_cached(
-                rough_cfg, weights_dir, device, _step_size_for(crop_task, rough_cfg),
-                cache, "rough:" + crop_task)
+        rough_preds = _build_predictors_cached(
+            rough_cfg, weights_dir, device, _step_size_for(crop_task, rough_cfg),
+            cache, "rough:" + crop_task)
         organ_seg = _predict_to_original_space(file_path, rough_preds, rough_cfg, crop_task)
         # rough_cfg.class_map_key is the real class map; crop_task may be an alias ("total_3mm").
         cmap_key  = rough_cfg.class_map_key
@@ -586,10 +551,9 @@ def _predict_to_original_space(file_path: str, predictors: dict, cfg: TaskConfig
         # at python_api.py:767 runs for standard crops too (roi_subset_crop = crop if crop is
         # not None ...) and overrides the per-task value. Replicate for parity.
         addon = [20, 20, 20] if cfg.crop_model is None else list(cfg.crop_addon)
-        with _prof("crop"):
-            # Crop img_orig directly (crop_to_mask_gpu slices, never mutates) — avoids an
-            # extra full-volume get_fdata() copy.
-            img_work, bbox = crop_to_mask_gpu(img_orig, crop_mask_nib, addon=addon, dtype=np.int32)
+        # Crop img_orig directly (crop_to_mask_gpu slices, never mutates) — avoids an
+        # extra full-volume get_fdata() copy.
+        img_work, bbox = crop_to_mask_gpu(img_orig, crop_mask_nib, addon=addon, dtype=np.int32)
     else:
         img_work = img_orig
 
@@ -600,8 +564,7 @@ def _predict_to_original_space(file_path: str, predictors: dict, cfg: TaskConfig
         # dtype=np.int32 matches official (nnunet.py:485-486): the resampled image is
         # truncated to int BEFORE the model. Float here diverges on low-signal MR edges
         # (e.g. total_mr scapula) and shifts the rough-seg liver mask → wrong crop bbox.
-        with _prof("in_resample"):
-            img_rsp = tseg_change_spacing(img_can, list(cfg.resample), order=3, dtype=np.int32, use_gpu=True)
+        img_rsp     = tseg_change_spacing(img_can, list(cfg.resample), order=3, dtype=np.int32, use_gpu=True)
         arr_xyz     = img_rsp.get_fdata().astype(np.float32)
         spacing_zyx = [float(cfg.resample[2]), float(cfg.resample[1]), float(cfg.resample[0])]
     else:
@@ -613,15 +576,10 @@ def _predict_to_original_space(file_path: str, predictors: dict, cfg: TaskConfig
     image = arr_xyz.transpose(2, 1, 0)[np.newaxis]   # (1, Z, Y, X)
     props = {'spacing': spacing_zyx}
 
-    _dump = os.environ.get("FASTSEG_DUMP")
-    if _dump:   # model-input-space image (== official s01_0000)
-        nib.save(img_rsp, os.path.join(_dump, f"{task_name}__my_input_rsp.nii.gz"))
-
     seg_combined = None
     global_idx   = {name: idx for idx, name in class_map[cfg.class_map_key].items()}
     for task_id, predictor in predictors.items():
-        with _prof("forward"):
-            part_seg = predictor.inference(image, props, use_softmax=cfg.use_softmax).numpy()
+        part_seg = predictor.inference(image, props, use_softmax=cfg.use_softmax).numpy()
         if seg_combined is None:
             seg_combined = np.zeros(part_seg.shape, dtype=np.uint8)
         _merge_part(part_seg, task_id, cfg, seg_combined, global_idx)
@@ -640,19 +598,15 @@ def _predict_to_original_space(file_path: str, predictors: dict, cfg: TaskConfig
         )
         seg_nib = nib.Nifti1Image(data, seg_nib.affine)
 
-    if _dump:   # segmentation at model-input resolution (== official s01 prediction)
-        nib.save(seg_nib, os.path.join(_dump, f"{task_name}__my_seg_rsp.nii.gz"))
-
     # Undo resample → canonical → crop (matches nnunet.py:706-728).
-    with _prof("out_resample"):
-        if cfg.resample is not None:
-            seg_nib = tseg_change_spacing(
-                seg_nib, list(cfg.resample), img_can_shape,
-                order=0, force_affine=img_can.affine, use_gpu=True,
-            )
-        seg_nib = tseg_undo_canonical(seg_nib, img_orig)
-        if bbox is not None:
-            seg_nib = undo_crop_gpu(seg_nib, img_orig, bbox)
+    if cfg.resample is not None:
+        seg_nib = tseg_change_spacing(
+            seg_nib, list(cfg.resample), img_can_shape,
+            order=0, force_affine=img_can.affine, use_gpu=True,
+        )
+    seg_nib = tseg_undo_canonical(seg_nib, img_orig)
+    if bbox is not None:
+        seg_nib = undo_crop_gpu(seg_nib, img_orig, bbox)
     return seg_nib
 
 
@@ -662,11 +616,7 @@ def infer_file(file_path: str, predictors: dict, cfg: TaskConfig, task_name: str
                roi_subset: tuple = (), v1_order: bool = False):
     crop_mask = remove_mask = None
     if cfg.crop:
-        _PROF_PREFIX[0] = "rough."          # tag rough-seg pre-pass stages distinctly
-        try:
-            crop_mask, remove_mask = build_crop_mask(file_path, cfg, weights_dir, device, cache)
-        finally:
-            _PROF_PREFIX[0] = ""
+        crop_mask, remove_mask = build_crop_mask(file_path, cfg, weights_dir, device, cache)
 
     seg_nib  = _predict_to_original_space(file_path, predictors, cfg, task_name, crop_mask)
     img_data = seg_nib.get_fdata().astype(np.uint8)
@@ -687,11 +637,10 @@ def infer_file(file_path: str, predictors: dict, cfg: TaskConfig, task_name: str
         img_data    = remove_outside_of_mask_gpu(img_data, remove_mask.get_fdata(), addon=dilation_vx)
 
     out_name = os.path.basename(file_path).replace("_0000.nii.gz", "").replace(".nii.gz", "")
-    with _prof("save"):
-        seg_out  = img_data.transpose(2, 1, 0).astype(np.uint8)   # XYZ → ZYX for sitk
-        sitk_img = sitk.GetImageFromArray(seg_out)
-        sitk_img.CopyInformation(sitk.ReadImage(file_path))
-        sitk.WriteImage(sitk_img, os.path.join(output_path, f"{out_name}.nii.gz"))
+    seg_out  = img_data.transpose(2, 1, 0).astype(np.uint8)   # XYZ → ZYX for sitk
+    sitk_img = sitk.GetImageFromArray(seg_out)
+    sitk_img.CopyInformation(sitk.ReadImage(file_path))
+    sitk.WriteImage(sitk_img, os.path.join(output_path, f"{out_name}.nii.gz"))
 
     # Derived body/skin masks. Official only emits these in split-file mode; we add
     # them in multilabel mode as a convenience (parity is judged on the multilabel array).
@@ -733,23 +682,11 @@ def main():
                              "prunes multi-model parts to those containing the subset")
     parser.add_argument("--v1_order", action="store_true", default=False,
                         help="Reorder `total` labels to the v1 label scheme (class_map total_v1)")
-    parser.add_argument("--scipy_resample", action="store_true", default=False,
-                        help="Diagnostic: build the main model with the scipy DefaultPreprocessor "
-                             "(separate-z aware) instead of the torch trilinear FastPreprocessor")
     args = parser.parse_args()
 
     cfg = TASK_CONFIGS[args.task]
     if args.use_softmax:
         cfg = replace(cfg, use_softmax=True)
-
-    # Use the torch resampler (cubic-B-spline order-3 input + separate-z order-1 output,
-    # auto-detecting anisotropy) for ALL modes by default. It reproduces nnU-Net's
-    # resample_data_or_seg (scipy/skimage order-3) to ~1e-13 on GPU. Trilinear (order-1)
-    # input caps sparse/low-confidence pathology modes (pleural/lung_nodules) at ~0.87 DSC;
-    # cubic lifts them to >0.999. Confident organ modes are unaffected (cubic≈trilinear there).
-    if "FASTSEG_SEPZ" not in os.environ:
-        os.environ["FASTSEG_SEPZ"] = "1"
-        print("[resample] torch cubic-B-spline (order-3) input + separate-z output enabled")
 
     roi_subset = tuple(args.roi_subset) if args.roi_subset else ()
     if roi_subset and not args.task.startswith("total"):
@@ -778,17 +715,24 @@ def main():
     device      = torch.device(args.device)
 
     step_size = _step_size_for(args.task, cfg)
-    os.makedirs(args.output_path, exist_ok=True)
+
+    # --- Input validation -----------------------------------------------------
+    if not os.path.isdir(args.input_path):
+        sys.exit(f"ERROR: input path is not a directory: {args.input_path}")
     files = sorted(glob.glob(os.path.join(args.input_path, "*.nii.gz")))
     if not files:
-        raise FileNotFoundError(f"No .nii.gz files found in {args.input_path}")
+        sys.exit(f"ERROR: no .nii.gz files found in {args.input_path}")
+    os.makedirs(args.output_path, exist_ok=True)
 
     # Predictor cache: main model + any rough/recursive crop-source models are built
     # once and reused across files (build_crop_mask / run_mode_to_original_space populate it).
     cache = {}
-    with _prof("load"):
-        predictors = _build_predictors_cached(cfg, weights_dir, device, step_size, cache, args.task,
-                                              use_fast=not args.scipy_resample)
+    try:
+        predictors = _build_predictors_cached(cfg, weights_dir, device, step_size, cache, args.task)
+    except FileNotFoundError as e:
+        sys.exit(f"ERROR: could not load weights for task '{args.task}' "
+                 f"(models {cfg.task_ids}) under {weights_dir}: {e}\n"
+                 f"Download the TotalSegmentator weights or pass --weights_dir.")
     if cfg.crop:
         src = cfg.crop_model if cfg.crop_model else rough_cfg_for(cfg)[0]
         print(f"[crop] source={src} (crop_model={cfg.crop_model}, crop={cfg.crop})")
@@ -796,17 +740,25 @@ def main():
     print(f"[task={args.task}] models={cfg.task_ids}  resample={cfg.resample}  step={step_size}  modality={cfg.modality}")
     print(f"Loading sub-model(s) from {weights_dir} ...")
 
+    # Per-case error handling: a single bad case (corrupt NIfTI, OOM, rough-seg failure)
+    # is logged and skipped — it never aborts the batch (mirrors nnunet_infer_nii.py).
+    failures = []
     for file in tqdm(files, desc=f"Inference ({args.task})"):
         print(f"\n{os.path.basename(file)}")
-        infer_file(file, predictors, cfg, args.task, args.output_path,
-                   weights_dir=weights_dir, device=device, cache=cache,
-                   roi_subset=roi_subset, v1_order=args.v1_order)
+        try:
+            infer_file(file, predictors, cfg, args.task, args.output_path,
+                       weights_dir=weights_dir, device=device, cache=cache,
+                       roi_subset=roi_subset, v1_order=args.v1_order)
+        except Exception as e:
+            failures.append(os.path.basename(file))
+            print(f"FAILED {os.path.basename(file)}: {type(e).__name__}: {e}")
+            empty_cache(device)
 
-    if os.environ.get("FASTSEG_PROFILE") and _PROF:
-        print("\n[PROFILE] stage wall-time (s):")
-        for k in sorted(_PROF, key=lambda x: -_PROF[x]):
-            print(f"  {k:24s} {_PROF[k]:7.2f}")
-        print(f"  {'SUM(stages)':24s} {sum(_PROF.values()):7.2f}")
+    if failures:
+        print(f"\n{len(failures)} of {len(files)} case(s) FAILED and were skipped:")
+        for f in failures:
+            print(f"  - {f}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

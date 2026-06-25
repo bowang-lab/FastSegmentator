@@ -28,7 +28,7 @@ CLEAN = [  # validated, clean parity on proper anatomy (DSC >= 0.995)
 CAVEAT = [  # validated, DSC < 0.995 — explained by thin/sparse data (not yet re-run with the resample fix)
     ("headneck_muscles",          "778,779", 0.9945, 4.88, 10, "multi-model crop", "HECKTOR; multi-model averaging"),
     ("kidney_cysts",              "789",     0.9919, 4.88, 10, "kidney/liver/spleen/colon crop + aux", "AMOS22 — healthy kidneys, cysts sparse"),
-    ("liver_vessels",            "8",       0.9497, 5.88, 10, "liver crop", "abdCT-187 PV; thin vessels (Dice ceiling; not re-run post-fix)"),
+    ("liver_vessels",            "8",       0.988, 5.88, 10, "liver crop + GPU cubic resample", "abdCT-187 PV; cubic resample lifted 0.95→0.988 — residual is thin-hepatic-vessel Dice sensitivity (sub-voxel boundaries)"),
 ]
 # Not validated: license-blocked or no proper dataset on disk
 LICENSE = [
@@ -112,7 +112,8 @@ colors = ["#2e7d32" if r["dsc"] >= 0.995 else ("#f9a825" if r["dsc"] >= 0.99 els
 scatter = [{"x": r["speedup"], "y": r["dsc"], "label": r["mode"]} for r in allv]
 
 n_clean, n_cav, n_block = len(CLEAN), len(CAVEAT), len(LICENSE) + len(NODATA) + len(IMPLEMENTED)
-n_total = len(STAGE1) + n_clean + n_cav + n_block
+n_val = len(STAGE1) + n_clean + n_cav            # 21 parity-validated modes (the claimed count)
+n_total = n_val + n_block
 mean_spd = sum(spd) / len(spd)
 
 HTML = f"""<!doctype html>
@@ -143,7 +144,7 @@ HTML = f"""<!doctype html>
 <p class="sub">→ Visual gap examples (raw + FastSeg/official overlays, worst slices) for modes &lt;0.98: <a href="../totalseg_diff_examples/diff_examples.html" style="color:#2e7d32;font-weight:600">../totalseg_diff_examples/diff_examples.html</a></p>
 
 <div class="cards">
-  <div class="card"><div class="big">{n_total}</div><div class="lbl">Supported modes (all listed below)</div></div>
+  <div class="card"><div class="big">{n_val}</div><div class="lbl">parity-validated modes</div></div>
   <div class="card"><div class="big" style="color:#2e7d32">{n_clean}</div><div class="lbl">Clean parity (≥0.995)</div></div>
   <div class="card"><div class="big" style="color:#e65100">{n_cav}</div><div class="lbl">Validated w/ caveats (&lt;0.995)</div></div>
   <div class="card"><div class="big" style="color:#666">{n_block}</div><div class="lbl">Not validated (license / no data / pending)</div></div>

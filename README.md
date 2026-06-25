@@ -7,10 +7,10 @@ clean, minimal inference module with only the necessary components, plus an
 **end-to-end GPU fast-path**: every stage — resampling (cucim + a GPU
 cubic-B-spline that matches scipy `order=3` to ~1e-13), normalization, the
 sliding-window forward pass, logits→label conversion, cropping, and
-connected-component postprocessing — runs on the GPU. It reproduces official
-TotalSegmentator output at **≥0.999 DSC parity** across all validated modes
-while running **2–9× faster** (forward-pass-bound; the rest is fixed
-import/model-load overhead amortized in batch).
+connected-component postprocessing — runs on the GPU. Across **21 parity-validated
+modes** it reproduces official TotalSegmentator output at **≥0.999 DSC on the headline
+modes** (≥0.995 on 18 of 21) while running **2–9× faster** (forward-pass-bound; the rest
+is fixed import/model-load overhead amortized in batch).
 
 ## Requirements
 
@@ -130,10 +130,13 @@ FastSegmentator nnunet \
 ## Parity with official TotalSegmentator
 
 The fast-path is validated to match official TotalSegmentator on the **same
-input** (parity, not vs. ground truth). Full interactive report:
-[`report/validation_report.html`](report/validation_report.html).
+input** (parity, not vs. ground truth) across **21 modes** (n=10 cases each).
+Overview + interactive figures: [`report/index.html`](report/index.html); full
+per-mode report: [`report/validation_report.html`](report/validation_report.html).
 
-All validated modes reach **≥0.999 DSC** vs official, at **2–9× speedup**:
+Of the 21 validated modes, **18 reach ≥0.995 DSC** — every previously-failing
+pathology mode is now **≥0.999** — and 3 thin/sparse modes carry small,
+characterized caveats, all at **2–9× speedup**:
 
 | Mode | Task | DSC vs official | Speedup |
 |------|------|-----------------|---------|

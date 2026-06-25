@@ -19,7 +19,7 @@ headneck_bones_vessels,776,0.9968,4.54,10,PASS,clean
 oculomotor_muscles,351,0.996,4.78,10,PASS,clean
 headneck_muscles,"778,779",0.9945,4.88,10,CAVEAT,caveat
 kidney_cysts,789,0.9919,4.88,10,CAVEAT,caveat
-liver_vessels,8,0.9497,5.88,10,CAVEAT,caveat
+liver_vessels,8,0.988,5.88,10,CAVEAT,caveat
 heartchambers_highres,301,,,,LICENSE,license
 coronary_arteries,509,,,,LICENSE,license
 coronary_arteries_LEGACY,507,,,,LICENSE,license

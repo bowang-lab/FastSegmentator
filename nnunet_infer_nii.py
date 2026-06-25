@@ -2,6 +2,7 @@ import argparse
 import gc
 import glob
 import os
+import sys
 from time import time
 from typing import Tuple, Union
 
@@ -94,45 +95,23 @@ def convert_predicted_logits_to_segmentation_with_correct_shape(
     target_shape = properties_dict['shape_after_cropping_and_before_resampling']
     original_spacing = [properties_dict['spacing'][i] for i in plans_manager.transpose_forward]
 
-    if os.environ.get("FASTSEG_SEPZ"):
-        # torch separate-z output resample (order=1, like nnU-Net resampling_fn_probabilities)
+    if target_shape[0] < 600:
+        # torch separate-z output resample (order=1, matches nnU-Net resampling_fn_probabilities;
+        # separate-z auto-detected by anisotropy). The production output resampler.
         from nnunetv2.preprocessing.resampling.default_resampling import torch_resample_data_or_seg_to_shape
         predicted_logits = torch_resample_data_or_seg_to_shape(
             predicted_logits, list(target_shape), current_spacing, original_spacing,
-            is_seg=False, order=1, order_z=0, force_separate_z=None)   # auto-detect sep-z
-        gc.collect(); empty_cache(predicted_logits.device)
+            is_seg=False, order=1, order_z=0, force_separate_z=None)
+        gc.collect()
+        empty_cache(predicted_logits.device)
         if use_softmax:
             segmentation = label_manager.convert_probabilities_to_segmentation(
                 label_manager.apply_inference_nonlin(predicted_logits))
         else:
             segmentation = logits_to_segmentation(predicted_logits)
-    elif os.environ.get("FASTSEG_SCIPY_OUTPUT"):
-        # Diagnostic: resample logits back with scipy separate-z (official nnU-Net path)
-        # instead of torch trilinear, to test whether output resampling drives parity gaps
-        # on anisotropic data.
-        from nnunetv2.preprocessing.resampling.default_resampling import resample_data_or_seg_to_shape
-        pl = predicted_logits.detach().cpu().float().numpy()
-        pl = resample_data_or_seg_to_shape(pl, list(target_shape), current_spacing, original_spacing, is_seg=False, order=1)  # order=1 = resampling_fn_probabilities (official)
-        predicted_logits = torch.from_numpy(np.asarray(pl))
-        segmentation = (label_manager.convert_probabilities_to_segmentation(
-                            label_manager.apply_inference_nonlin(predicted_logits))
-                        if use_softmax else logits_to_segmentation(predicted_logits))
-    elif target_shape[0] < 600:
-        # Resample logits then convert to segmentation
-        predicted_logits = fast_resample_logit_to_shape(
-            predicted_logits, target_shape, current_spacing, original_spacing
-        )
-        gc.collect()
-        empty_cache(predicted_logits.device)
-
-        if use_softmax:
-            predicted_probabilities = label_manager.apply_inference_nonlin(predicted_logits)
-            del predicted_logits
-            segmentation = label_manager.convert_probabilities_to_segmentation(predicted_probabilities)
-        else:
-            segmentation = logits_to_segmentation(predicted_logits)
     else:
-        # For large volumes, resample directly (argmax during resampling)
+        # Large volume: memory-efficient resample with argmax during resampling
+        # (avoids materializing the full resampled logit tensor).
         segmentation = fast_resample_logit_to_shape(
             predicted_logits, target_shape, current_spacing, original_spacing
         )
@@ -365,6 +344,15 @@ def main():
     perform_everything_on_device = args.device != 'cpu'
     device = torch.device(args.device, 0)
 
+    # Validate inputs before loading the model (fail fast, no wasted GPU load).
+    if not os.path.isdir(args.input_path):
+        sys.exit(f"ERROR: input path is not a directory: {args.input_path}")
+    files = sorted(glob.glob(os.path.join(args.input_path, '*.nii.gz')))
+    if not files:
+        sys.exit(f"ERROR: no .nii.gz files found in {args.input_path}")
+    output_folder = args.output_path
+    os.makedirs(output_folder, exist_ok=True)
+
     predictor = SimplePredictor(
         tile_step_size=0.5,
         use_gaussian=True,
@@ -375,16 +363,16 @@ def main():
         verbose_preprocessing=False,
         allow_tqdm=False,
     )
-    predictor.initialize_from_trained_model_folder(
-        args.model_path,
-        use_folds=args.fold,
-        checkpoint_name=args.checkpoint,
-    )
+    try:
+        predictor.initialize_from_trained_model_folder(
+            args.model_path,
+            use_folds=args.fold,
+            checkpoint_name=args.checkpoint,
+        )
+    except (FileNotFoundError, RuntimeError) as e:
+        sys.exit(f"ERROR: could not load model from {args.model_path} "
+                 f"(fold={args.fold}, checkpoint={args.checkpoint}): {e}")
     predictor.network.to(device)
-
-    output_folder = args.output_path
-    os.makedirs(output_folder, exist_ok=True)
-    files = glob.glob(os.path.join(args.input_path, '*.nii.gz'))
 
     failures = []
     for file in tqdm(files):
@@ -412,6 +400,7 @@ def main():
         print(f'\n{len(failures)} case(s) FAILED and were skipped:')
         for f in failures:
             print(f'  - {f}')
+        sys.exit(1)
 
 
 if __name__ == "__main__":
