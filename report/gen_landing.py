@@ -143,7 +143,7 @@ def parity_table():
             body += row([f"<code>{m}</code>", t, f'<span class="num">{badge} {d:.4f}</span>',
                          f'<span class="num">{s:.1f}×</span>', status])
     return (f'<div class="scroll"><table>{head}{body}</table></div>'
-            f'<p class="cap" style="text-align:left">All {n_val} parity-validated modes (n=10 cases each). '
+            f'<p class="cap" style="text-align:left">All {n_val} parity-validated modes (n=3–10 cases each). '
             f'{n_other} further modes are implemented and dispatchable but not yet parity-validated '
             f'(license-restricted, no on-disk dataset, or pending) — not claimed here.</p>')
 
@@ -263,7 +263,7 @@ TEMPLATE = r"""<!doctype html>
     <div class="grid2">
       %%REQ_TABLE%%
       <div class="chartbox"><h3 style="margin:.2em 0 0;font-size:15px;color:#33414f">Peak GPU memory by mode (GB)</h3>
-        <canvas id="vramChart" height="220"></canvas></div>
+        <canvas id="vramChart" height="260"></canvas></div>
     </div>
   </section>
 
@@ -274,7 +274,7 @@ TEMPLATE = r"""<!doctype html>
       in batch the per-case cost collapses toward the forward-pass ratio.</p>
     <div class="grid2">
       <div class="chartbox"><h3 style="margin:.2em 0 0;font-size:15px;color:#33414f">Speedup vs official (×)</h3>
-        <canvas id="spdChart" height="320"></canvas></div>
+        <canvas id="spdChart" height="380"></canvas></div>
       <div class="chartbox"><h3 style="margin:.2em 0 0;font-size:15px;color:#33414f">Single-case runtime composition</h3>
         <div class="rtlegend">%%RT_LEGEND%%</div>
         <div class="pies">
@@ -296,7 +296,7 @@ TEMPLATE = r"""<!doctype html>
     %%PARITY_TABLE%%
     <div class="grid2">
       <div class="chartbox"><h3 style="margin:.2em 0 0;font-size:15px;color:#33414f">DSC by mode</h3>
-        <canvas id="dscChart" height="420"></canvas></div>
+        <canvas id="dscChart" height="400"></canvas></div>
       <div class="chartbox"><h3 style="margin:.2em 0 0;font-size:15px;color:#33414f">DSC vs speedup</h3>
         <canvas id="scChart" height="420"></canvas></div>
     </div>
@@ -334,12 +334,13 @@ TEMPLATE = r"""<!doctype html>
 const D = %%CHART_DATA%%;
 const baseBar = (horizontal)=>({indexAxis:horizontal?'y':'x',responsive:true,
   plugins:{legend:{display:false}},maintainAspectRatio:false});
+const catX = {ticks:{maxRotation:90,minRotation:90,font:{size:10},autoSkip:false}};
 new Chart(spdChart,{type:'bar',data:{labels:D.spdLabels,
   datasets:[{data:D.spdVals,backgroundColor:'#1565c0'}]},
-  options:{...baseBar(true),scales:{x:{title:{display:true,text:'speedup vs official (×)'}}}}});
+  options:{...baseBar(false),scales:{x:catX,y:{title:{display:true,text:'speedup vs official (×)'}}}}});
 new Chart(dscChart,{type:'bar',data:{labels:D.dscLabels,
   datasets:[{data:D.dscVals,backgroundColor:D.dscColors}]},
-  options:{...baseBar(true),scales:{x:{min:0.75,max:1.0,title:{display:true,text:'mean DSC'}}}}});
+  options:{...baseBar(false),scales:{x:catX,y:{min:0.75,max:1.0,title:{display:true,text:'mean DSC'}}}}});
 new Chart(scChart,{type:'scatter',data:{datasets:[{data:D.scatter,
   backgroundColor:D.scatter.map(p=>p.y>=0.995?'#2e7d32':(p.y>=0.99?'#f9a825':'#e65100')),pointRadius:6}]},
   options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},
@@ -358,7 +359,7 @@ const mkPie=(cv,vals)=>new Chart(cv,{type:'pie',data:{labels:D.rtComponents,
 mkPie(rtChart0,D.rtData[0]); mkPie(rtChart1,D.rtData[1]);
 new Chart(vramChart,{type:'bar',data:{labels:D.vramLabels,
   datasets:[{data:D.vramVals,backgroundColor:D.vramVals.map(v=>v<=4?'#2e7d32':'#1565c0')}]},
-  options:{...baseBar(true),scales:{x:{max:8,title:{display:true,text:'peak GPU memory (GB) · 8 GB recommended'}}}}});
+  options:{...baseBar(false),scales:{y:{max:8,title:{display:true,text:'peak GPU memory (GB) · 8 GB recommended'}}}}});
 </script>
 </body></html>"""
 
