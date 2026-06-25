@@ -260,7 +260,11 @@ TEMPLATE = r"""<!doctype html>
     <p class="lead">Compute is GPU-only. Measured peak GPU memory is ~6.2 GB on the heaviest
       full-body modes and ~3.3 GB for cropped single-model modes — an <b>8 GB</b> card covers all
       modes with headroom.</p>
-    %%REQ_TABLE%%
+    <div class="grid2">
+      %%REQ_TABLE%%
+      <div class="chartbox"><h3 style="margin:.2em 0 0;font-size:15px;color:#33414f">Peak GPU memory by mode (GB)</h3>
+        <canvas id="vramChart" height="180"></canvas></div>
+    </div>
   </section>
 
   <section>
@@ -268,10 +272,19 @@ TEMPLATE = r"""<!doctype html>
     <p class="lead">The GPU forward pass — the real compute — is <b>6–9× faster</b> than official.
       Cold single-case wall-clock is 2–9× (a fixed ~4.7 s Python import + model load doesn't shrink);
       in batch the per-case cost collapses toward the forward-pass ratio.</p>
+    <div class="grid2">
+      <div class="chartbox"><h3 style="margin:.2em 0 0;font-size:15px;color:#33414f">Speedup vs official (×)</h3>
+        <canvas id="spdChart" height="300"></canvas></div>
+      <div class="chartbox"><h3 style="margin:.2em 0 0;font-size:15px;color:#33414f">Single-case runtime composition</h3>
+        <div class="rtlegend">%%RT_LEGEND%%</div>
+        <div class="pies">
+          <div><canvas id="rtChart0" height="170"></canvas><div class="cap">%%RT_CAP0%%</div></div>
+          <div><canvas id="rtChart1" height="170"></canvas><div class="cap">%%RT_CAP1%%</div></div>
+        </div></div>
+    </div>
     %%FWD_TABLE%%
-    <div class="note">Per-mode speedups span 2–9× (see the validation table). Single-case wall-clock
-      is dominated by a fixed ~4.7 s Python/torch import plus model load — not compute — so it
-      amortizes to ~zero when a batch is processed in one process, leaving the forward-pass ratio.</div>
+    <div class="note">Single-case is import/load-bound; those are fixed startup costs amortized to
+      ~zero when processing a batch in one process.</div>
   </section>
 
   <section>
@@ -281,8 +294,12 @@ TEMPLATE = r"""<!doctype html>
       pathology mode now ≥0.999), %%NCAV%% thin/sparse modes with small, characterized caveats.
       Detailed per-mode report: <a href="validation_report.html">validation_report.html →</a></p>
     %%PARITY_TABLE%%
-    <div class="chartbox"><h3 style="margin:.2em 0 0;font-size:15px;color:#33414f">DSC vs speedup (every validated mode)</h3>
-      <canvas id="scChart" height="240"></canvas></div>
+    <div class="grid2">
+      <div class="chartbox"><h3 style="margin:.2em 0 0;font-size:15px;color:#33414f">DSC by mode</h3>
+        <canvas id="dscChart" height="300"></canvas></div>
+      <div class="chartbox"><h3 style="margin:.2em 0 0;font-size:15px;color:#33414f">DSC vs speedup</h3>
+        <canvas id="scChart" height="240"></canvas></div>
+    </div>
   </section>
 
   <section>
@@ -315,6 +332,15 @@ TEMPLATE = r"""<!doctype html>
 <script>%%CHARTJS%%</script>
 <script>
 const D = %%CHART_DATA%%;
+const baseBar = (horizontal)=>({indexAxis:horizontal?'y':'x',responsive:true,
+  plugins:{legend:{display:false}},maintainAspectRatio:false});
+const catX = {ticks:{maxRotation:90,minRotation:90,font:{size:10},autoSkip:false}};
+new Chart(spdChart,{type:'bar',data:{labels:D.spdLabels,
+  datasets:[{data:D.spdVals,backgroundColor:'#1565c0'}]},
+  options:{...baseBar(false),scales:{x:catX,y:{title:{display:true,text:'speedup vs official (×)'}}}}});
+new Chart(dscChart,{type:'bar',data:{labels:D.dscLabels,
+  datasets:[{data:D.dscVals,backgroundColor:D.dscColors}]},
+  options:{...baseBar(false),scales:{x:catX,y:{min:0.75,max:1.0,title:{display:true,text:'mean DSC'}}}}});
 new Chart(scChart,{type:'scatter',data:{datasets:[{data:D.scatter,
   backgroundColor:D.scatter.map(p=>p.y>=0.995?'#2e7d32':(p.y>=0.99?'#f9a825':'#e65100')),pointRadius:6}]},
   options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},
@@ -323,8 +349,17 @@ new Chart(scChart,{type:'scatter',data:{datasets:[{data:D.scatter,
 new Chart(fixChart,{type:'bar',data:{labels:D.fixLabels,datasets:[
   {label:'before',data:D.fixBefore,backgroundColor:'#e0816a'},
   {label:'after (GPU fixes)',data:D.fixAfter,backgroundColor:'#2e7d32'}]},
-  options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:true,position:'bottom'}},
+  options:{responsive:true,maintainAspectRatio:false,
     scales:{y:{min:0.75,max:1.005,title:{display:true,text:'DSC'}}}}});
+const mkPie=(cv,vals)=>new Chart(cv,{type:'pie',data:{labels:D.rtComponents,
+  datasets:[{data:vals,backgroundColor:D.rtPalette,borderColor:'#fff',borderWidth:1.5}]},
+  options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},
+    tooltip:{callbacks:{label:c=>c.label+': '+c.raw.toFixed(2)+' s ('+
+      (100*c.raw/c.dataset.data.reduce((a,b)=>a+b,0)).toFixed(0)+'%)'}}}}});
+mkPie(rtChart0,D.rtData[0]); mkPie(rtChart1,D.rtData[1]);
+new Chart(vramChart,{type:'bar',data:{labels:D.vramLabels,
+  datasets:[{data:D.vramVals,backgroundColor:D.vramVals.map(v=>v<=4?'#2e7d32':'#1565c0')}]},
+  options:{...baseBar(false),scales:{y:{max:8,title:{display:true,text:'peak GPU memory (GB) · 8 GB recommended'}}}}});
 </script>
 </body></html>"""
 
@@ -333,6 +368,9 @@ html = (TEMPLATE
         .replace("%%N995%%", str(n_995))
         .replace("%%NCAV%%", str(n_cav))
         .replace("%%REQ_TABLE%%", req_table())
+        .replace("%%RT_LEGEND%%", rt_legend())
+        .replace("%%RT_CAP0%%", rt_caps()[0])
+        .replace("%%RT_CAP1%%", rt_caps()[1])
         .replace("%%FWD_TABLE%%", fwd_table())
         .replace("%%PARITY_TABLE%%", parity_table())
         .replace("%%FIX_TABLE%%", fix_table())
