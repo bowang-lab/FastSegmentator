@@ -140,20 +140,34 @@ characterized caveats, all at **2–9× speedup**:
 
 | Mode | Task | DSC vs official | Speedup |
 |------|------|-----------------|---------|
-| `total` (CT) | 291–295 | 1.0000 | 9.6× |
-| `total_mr` | 850,851 | 0.9999 | 9.5× |
-| `lung_vessels` | 117 | 0.99998 | 2.8× |
-| `lung_vessels_LEGACY` | 258 | 0.99989 | 4.2× |
-| `lung_nodules` | 913 | 0.9999 | 7.5× |
+| `total` | 291–295 | 1.0000 | 9.6× |
 | `liver_lesions` | 591 | 1.0000 | 4.9× |
-| `liver_lesions_mr` | 589 | 1.0000¹ | 6.2× |
+| `liver_lesions_mr`¹ | 589 | 1.0000 | 6.2× |
 | `liver_segments_mr` | 576 | 1.0000 | 6.7× |
+| `trunk_cavities` | 343 | 1.0000 | 4.1× |
+| `lung_vessels` | 117 | 0.9999 | 2.8× |
+| `teeth` | 113 | 0.9999 | 3.9× |
+| `total_mr` | 850,851 | 0.9999 | 9.5× |
+| `lung_nodules` | 913 | 0.9999 | 7.5× |
+| `vertebrae_mr` | 756 | 0.9999 | 4.6× |
+| `lung_vessels_LEGACY` | 258 | 0.9999 | 4.2× |
+| `craniofacial_structures` | 115 | 0.9998 | 4.0× |
+| `body` | 299 | 0.9996 | 2.3× |
 | `pleural_pericard_effusion` | 315 | 0.9990 | 9.3× |
-| `craniofacial_structures`, `head_muscles`, `liver_segments`, `body`, … | — | ≥0.996 | 2–5× |
+| `head_muscles` | 777 | 0.9989 | 5.1× |
+| `head_glands_cavities` | 775 | 0.9987 | 5.0× |
+| `liver_segments` | 570 | 0.9984 | 5.2× |
+| `abdominal_muscles` | 952 | 0.9981 | 4.6× |
+| `headneck_bones_vessels` | 776 | 0.9968 | 4.5× |
+| `oculomotor_muscles` | 351 | 0.9960 | 4.8× |
+| `body_mr` | 597 | 0.9956 | 4.9× |
+| `headneck_muscles` | 778,779 | 0.9945 | 4.9× |
+| `kidney_cysts` | 789 | 0.9919 | 4.9× |
+| `liver_vessels` | 8 | 0.9880 | 5.9× |
 
-¹ 86-voxel lesion on the crop boundary — nondeterministic on *both* pipelines
-(official itself flips 86/52 voxels across runs); our deterministic output
-matches official's same-draw at DSC 1.0.
+¹ `liver_lesions_mr` — an 86-voxel lesion on the crop boundary, nondeterministic
+on *both* pipelines (official itself flips 86/52 voxels across runs); our
+deterministic output matches official's same-draw at DSC 1.0.
 
 **Three fixes brought the harder modes to parity** (each isolated by bisecting
 against official's per-function intermediates):
