@@ -17,6 +17,9 @@ liver_segments,570,0.9984,5.19,10,PASS,clean
 abdominal_muscles,952,0.9981,4.56,10,PASS,clean
 headneck_bones_vessels,776,0.9968,4.54,10,PASS,clean
 oculomotor_muscles,351,0.996,4.78,10,PASS,clean
+trunk_cavities,343,1.0,4.07,3,PASS,clean
+vertebrae_mr,756,0.9999,4.57,3,PASS,clean
+body_mr,597,0.9956,4.86,3,PASS,clean
 headneck_muscles,"778,779",0.9945,4.88,10,CAVEAT,caveat
 kidney_cysts,789,0.9919,4.88,10,CAVEAT,caveat
 liver_vessels,8,0.988,5.88,10,CAVEAT,caveat
@@ -38,8 +41,5 @@ vertebrae_body,305,,,,LICENSE,license
 cerebral_bleed,150,,,,NO_DATA,nodata
 ventricle_parts,552,,,,NO_DATA,nodata
 brain_aneurysm,615,,,,NO_DATA,nodata
-body_mr,597,,,,PENDING,implemented
 breasts,527,,,,PENDING,implemented
 hip_implant,260,,,,PENDING,implemented
-trunk_cavities,343,,,,PENDING,implemented
-vertebrae_mr,756,,,,PENDING,implemented

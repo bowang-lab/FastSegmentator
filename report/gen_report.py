@@ -24,6 +24,9 @@ CLEAN = [  # validated, clean parity on proper anatomy (DSC >= 0.995)
     ("abdominal_muscles",       "952", 0.9981, 4.56, 10, "body_trunc crop (Z=600 fix)", "AMOS22 CT"),
     ("headneck_bones_vessels",  "776", 0.9968, 4.54, 10, "clavicula/vertebrae crop, high-res", "HECKTOR"),
     ("oculomotor_muscles",      "351", 0.9960, 4.78, 10, "skull crop", "HECKTOR"),
+    ("trunk_cavities",          "343", 1.0000, 4.07, 3, "uncropped CT (thoracic/abdominal cavities)", "AMOS22 CT"),
+    ("vertebrae_mr",            "756", 0.9999, 4.57, 3, "uncropped MR (spine)", "AMOS22 MR"),
+    ("body_mr",                 "597", 0.9956, 4.86, 3, "uncropped MR (body trunk/extremities)", "AMOS22 MR"),
 ]
 CAVEAT = [  # validated, DSC < 0.995 — explained by thin/sparse data (not yet re-run with the resample fix)
     ("headneck_muscles",          "778,779", 0.9945, 4.88, 10, "multi-model crop", "HECKTOR; multi-model averaging"),
@@ -53,13 +56,10 @@ NODATA = [
     ("ventricle_parts","552", "Brain CT", "No brain-CT dataset on disk"),
     ("brain_aneurysm", "615", "TOF-MRA brain", "No TOF-MRA on disk; uncropped, folds=None"),
 ]
-# Implemented & dispatchable (open weights), but no parity run done yet
+# Implemented & dispatchable (open weights), but no on-disk dataset to parity-validate
 IMPLEMENTED = [
-    ("body_mr",        "597", "Body trunk/extremities (MR)", "Open; runs, not yet parity-validated"),
-    ("breasts",        "527", "Breast tissue (CT)", "Open; runs, not yet parity-validated"),
-    ("hip_implant",    "260", "Hip implant (CT, femur/hip crop)", "Open; runs, not yet parity-validated"),
-    ("trunk_cavities", "343", "Thoracic/abdominal cavities (CT)", "Open; runs, not yet parity-validated"),
-    ("vertebrae_mr",   "756", "Vertebrae (MR)", "Open; runs, not yet parity-validated"),
+    ("breasts",     "527", "Breast tissue (CT)", "Open; no chest-CT dataset on disk (AMOS is abdominal, Luna25 are lung patches)"),
+    ("hip_implant", "260", "Hip implant (CT, femur/hip crop)", "Open; needs a CT containing an implant"),
 ]
 # Stage 1 — whole-body multi-model totals (uncropped). n=10 vs official.
 STAGE1 = [
