@@ -36,10 +36,6 @@ import SimpleITK as sitk
 import torch
 from tqdm import tqdm
 
-_TOTALSEG_SRC = Path(__file__).parent.parent / "TotalSegmentator"
-if _TOTALSEG_SRC.exists():
-    sys.path.insert(0, str(_TOTALSEG_SRC))
-
 # --- Custom trainer registration ---------------------------------------------
 # SimplePredictor.initialize_from_trained_model_folder() resolves the trainer
 # class by name via `nnunet_infer_nii.recursive_find_python_class`. Patch that
@@ -80,7 +76,7 @@ def _custom_find_class(folder, class_name, current_module):
     return recursive_find_python_class(folder, class_name, current_module)
 
 
-import nnunet_infer_nii  # noqa: E402
+from . import nnunet_infer_nii  # noqa: E402
 nnunet_infer_nii.recursive_find_python_class = _custom_find_class
 
 # --- Project imports ---------------------------------------------------------
@@ -110,7 +106,7 @@ from totalsegmentator.map_to_binary import (  # noqa: E402
 from totalsegmentator.resampling import change_spacing as tseg_change_spacing  # noqa: E402
 from totalsegmentator.libs import reorder_multilabel_like_v1  # noqa: E402
 
-from nnunet_infer_nii import SimplePredictor  # noqa: E402
+from .nnunet_infer_nii import SimplePredictor  # noqa: E402
 
 
 CHECKPOINT = "checkpoint_final.pth"

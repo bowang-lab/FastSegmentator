@@ -1,0 +1,25 @@
+FastSegmentator
+Copyright (c) 2026 the FastSegmentator authors
+
+This product bundles vendored copies of third-party software:
+
+-------------------------------------------------------------------------------
+nnU-Net v2 (nnunetv2)
+-------------------------------------------------------------------------------
+A trimmed and modified fork of nnU-Net v2 is vendored under `nnunetv2/`.
+Upstream: https://github.com/MIC-DKFZ/nnUNet
+License: Apache-2.0 (see nnunetv2/LICENSE).
+Modifications: pipeline trimmed to the inference path; added GPU implementations
+(gpu_postprocessing, crop_to_mask_gpu/undo_crop_gpu, fast/torch resamplers).
+
+-------------------------------------------------------------------------------
+TotalSegmentator
+-------------------------------------------------------------------------------
+A subset of TotalSegmentator is vendored under `totalsegmentator/`, copied
+verbatim from upstream commit 44151b4 (v2.13.0-32-g44151b4).
+Upstream: https://github.com/wasserth/TotalSegmentator
+License: Apache-2.0 (see totalsegmentator/LICENSE).
+Vendored modules: alignment.py, config.py, postprocessing.py, map_to_binary.py,
+resampling.py, libs.py, cropping.py, nifti_ext_header.py.
+To update: re-copy these modules from a newer upstream checkout and re-run the
+parity validation in report/.

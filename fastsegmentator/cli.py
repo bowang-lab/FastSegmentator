@@ -39,9 +39,9 @@ def main():
     sys.argv = [f"FastSegmentator {command}"] + sys.argv[2:]
 
     if command == "totalseg":
-        from totalseg_infer import main as run
+        from .totalseg_infer import main as run
     else:  # "nnunet"
-        from nnunet_infer_nii import main as run
+        from .nnunet_infer_nii import main as run
     run()
 
 

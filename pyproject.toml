@@ -1,18 +1,60 @@
 [project]
 name = "fastsegmentator"
 version = "0.1.0"
+description = "Fast end-to-end GPU inference for nnU-Net and TotalSegmentator, parity-validated to official TotalSegmentator at >=0.999 DSC and 2-9x faster."
+readme = "README.md"
 requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "Ching-Yuan Yu", email = "ching-yuan.yu@uhn.ca" }]
+keywords = [
+    "medical image segmentation",
+    "nnU-Net",
+    "TotalSegmentator",
+    "GPU inference",
+    "CT",
+    "MRI",
+]
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Healthcare Industry",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+# nnunetv2 and totalsegmentator are vendored INSIDE this distribution (see NOTICE),
+# so they are NOT dependencies. These are the third-party libs the vendored code needs.
 dependencies = [
-    "nnunetv2",
-    "totalsegmentator",
-    "cupy-cuda12x",
-    "cucim-cu12",
     "torch==2.5.1",
     "torchvision==0.20.1",
+    "cupy-cuda12x",
+    "cucim-cu12",
+    "acvl-utils>=0.2,<0.3",
+    "dynamic-network-architectures>=0.3.1,<0.4",
+    "batchgenerators>=0.25",
+    "batchgeneratorsv2>=0.2",
+    "numpy>=1.24",
+    "scipy",
+    "scikit-learn",
+    "scikit-image>=0.19.3",
+    "SimpleITK>=2.2.1",
+    "nibabel",
+    "pandas",
+    "tqdm",
+    "dicom2nifti",
+    "tifffile",
+    "requests",
+    "imagecodecs",
+    "einops",
+    "joblib",
 ]
 
+[project.urls]
+repository = "https://github.com/JunMa11/FastSegmentator"
+
 [project.scripts]
-FastSegmentator = "cli:main"
+FastSegmentator = "fastsegmentator.cli:main"
 
 [dependency-groups]
 dev = ["pytest>=7"]
@@ -25,12 +67,19 @@ addopts = "-q"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+# One distribution ships all three import packages: the FastSegmentator CLI/pipeline,
+# the vendored (trimmed + GPU-modified) nnunetv2 fork from src/, and the vendored
+# TotalSegmentator subset. `src/nnunetv2` installs as top-level `nnunetv2`.
 [tool.hatch.build.targets.wheel]
-only-include = ["cli.py", "totalseg_infer.py", "nnunet_infer_nii.py"]
+packages = ["fastsegmentator", "totalsegmentator", "src/nnunetv2"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"NOTICE" = "fastsegmentator/NOTICE"
+
+[tool.hatch.build.targets.sdist]
+include = ["fastsegmentator", "totalsegmentator", "src/nnunetv2", "LICENSE", "NOTICE", "README.md"]
 
 [tool.uv.sources]
-nnunetv2 = { path = "src", editable = true }
-totalsegmentator = { path = "../TotalSegmentator", editable = true }
 torch = { index = "pytorch-cu121" }
 torchvision = { index = "pytorch-cu121" }
 

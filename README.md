@@ -18,34 +18,34 @@ is fixed import/model-load overhead amortized in batch).
 - **CUDA**: 12.4
 - [**uv**](https://docs.astral.sh/uv/) for environment management
 
-## Installation
+FastSegmentator is **self-contained**: a trimmed, GPU-modified fork of `nnunetv2`
+(in `src/`) and the TotalSegmentator subset it needs (in `totalsegmentator/`) are
+**vendored into the package** (see [`NOTICE`](NOTICE)) — no sibling checkouts or
+external installs of those two projects are required.
 
-1. Clone this repo. The vendored `nnunetv2` lives in `src/`, and
-   `TotalSegmentator` is expected as a sibling checkout (see
-   `[tool.uv.sources]` in `pyproject.toml`):
+> **CUDA prerequisites.** The GPU stack (`cupy-cuda12x`, `cucim-cu12`, and the pinned
+> CUDA 12.1 `torch`/`torchvision` wheels) needs a working CUDA 12 toolchain. `torch`
+> is resolved from the PyTorch cu121 index; pass
+> `--extra-index-url https://download.pytorch.org/whl/cu121` if you install with plain
+> `pip`.
+
+### Option A — development (uv)
 
 ```bash
 git clone https://github.com/JunMa11/FastSegmentator.git
-git clone https://github.com/wasserth/TotalSegmentator.git   # sibling of FastSegmentator
 cd FastSegmentator
-```
-
-2. Create the environment and install everything (including the
-   `FastSegmentator` command) in one step:
-
-```bash
-uv sync
-```
-
-`uv sync` builds the editable `nnunetv2` package from `src/`, installs the
-pinned CUDA 12.1 torch wheels, `cupy`/`cucim`, and registers the
-`FastSegmentator` console script into `.venv/`.
-
-3. Activate the environment so the `FastSegmentator` command is on your PATH:
-
-```bash
+uv sync                  # builds the env + registers the FastSegmentator command
 source .venv/bin/activate
 ```
+
+### Option B — install the package
+
+```bash
+pip install . --extra-index-url https://download.pytorch.org/whl/cu121
+```
+
+Either path registers the `FastSegmentator` console command and ships the vendored
+`nnunetv2` + `totalsegmentator` subset inside the distribution.
 
 ## Data and Model Weights
 

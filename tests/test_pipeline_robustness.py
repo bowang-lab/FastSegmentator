@@ -120,7 +120,7 @@ def test_gpu_postprocess_matches_scipy():
 # Input validation / error handling (CPU, via the CLI)
 # ---------------------------------------------------------------------------
 def _run(args):
-    return subprocess.run([sys.executable, str(REPO / "totalseg_infer.py"), *args],
+    return subprocess.run([sys.executable, "-m", "fastsegmentator.totalseg_infer", *args],
                           capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(REPO))
 
 
