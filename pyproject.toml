@@ -1,6 +1,6 @@
 [project]
 name = "fastsegmentator"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fast end-to-end GPU inference for nnU-Net and TotalSegmentator, parity-validated to official TotalSegmentator at >=0.999 DSC and 2-9x faster."
 readme = "README.md"
 requires-python = ">=3.9"
