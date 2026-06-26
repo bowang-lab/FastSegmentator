@@ -11,20 +11,20 @@ import SimpleITK as sitk
 import torch
 from tqdm import tqdm
 
-import nnunetv2
+from fastsegmentator._vendor import nnunetv2
 import numpy as np
 from acvl_utils.cropping_and_padding.bounding_boxes import bounding_box_to_slice
 from acvl_utils.cropping_and_padding.padding import pad_nd_image
 from batchgenerators.utilities.file_and_folder_operations import load_json, join
-from nnunetv2.imageio.simpleitk_reader_writer import SimpleITKIO
-from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
-from nnunetv2.inference.sliding_window_prediction import compute_gaussian
-from nnunetv2.preprocessing.resampling.default_resampling import fast_resample_logit_to_shape
-from nnunetv2.utilities.find_class_by_name import recursive_find_python_class
-from nnunetv2.utilities.helpers import empty_cache, dummy_context
-from nnunetv2.utilities.label_handling.label_handling import LabelManager, determine_num_input_channels
-from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
-from nnunetv2.utilities.utils import log_runtime
+from fastsegmentator._vendor.nnunetv2.imageio.simpleitk_reader_writer import SimpleITKIO
+from fastsegmentator._vendor.nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+from fastsegmentator._vendor.nnunetv2.inference.sliding_window_prediction import compute_gaussian
+from fastsegmentator._vendor.nnunetv2.preprocessing.resampling.default_resampling import fast_resample_logit_to_shape
+from fastsegmentator._vendor.nnunetv2.utilities.find_class_by_name import recursive_find_python_class
+from fastsegmentator._vendor.nnunetv2.utilities.helpers import empty_cache, dummy_context
+from fastsegmentator._vendor.nnunetv2.utilities.label_handling.label_handling import LabelManager, determine_num_input_channels
+from fastsegmentator._vendor.nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
+from fastsegmentator._vendor.nnunetv2.utilities.utils import log_runtime
 
 
 def _canonical_transform(direction_tuple):
@@ -98,7 +98,7 @@ def convert_predicted_logits_to_segmentation_with_correct_shape(
     if target_shape[0] < 600:
         # torch separate-z output resample (order=1, matches nnU-Net resampling_fn_probabilities;
         # separate-z auto-detected by anisotropy). The production output resampler.
-        from nnunetv2.preprocessing.resampling.default_resampling import torch_resample_data_or_seg_to_shape
+        from fastsegmentator._vendor.nnunetv2.preprocessing.resampling.default_resampling import torch_resample_data_or_seg_to_shape
         predicted_logits = torch_resample_data_or_seg_to_shape(
             predicted_logits, list(target_shape), current_spacing, original_spacing,
             is_seg=False, order=1, order_z=0, force_separate_z=None)
@@ -171,12 +171,12 @@ class SimplePredictor(nnUNetPredictor):
         trainer_class = recursive_find_python_class(
             join(nnunetv2.__path__[0], "training", "nnUNetTrainer"),
             trainer_name,
-            'nnunetv2.training.nnUNetTrainer',
+            'fastsegmentator._vendor.nnunetv2.training.nnUNetTrainer',
         )
         if trainer_class is None:
             raise RuntimeError(
                 f'Unable to locate trainer class {trainer_name} in '
-                f'nnunetv2.training.nnUNetTrainer or any directory listed in '
+                f'fastsegmentator._vendor.nnunetv2.training.nnUNetTrainer or any directory listed in '
                 f'nnUNet_extTrainer={os.environ.get("nnUNet_extTrainer", "")!r}'
             )
 

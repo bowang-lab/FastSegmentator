@@ -41,9 +41,9 @@ from tqdm import tqdm
 # class by name via `nnunet_infer_nii.recursive_find_python_class`. Patch that
 # module-level reference so our stubs are reachable at checkpoint-load time.
 
-from nnunetv2.utilities.find_class_by_name import recursive_find_python_class  # noqa: E402
-from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer  # noqa: E402
-from nnunetv2.training.nnUNetTrainer.variants.data_augmentation.nnUNetTrainerNoMirroring import nnUNetTrainerNoMirroring  # noqa: E402
+from fastsegmentator._vendor.nnunetv2.utilities.find_class_by_name import recursive_find_python_class  # noqa: E402
+from fastsegmentator._vendor.nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer  # noqa: E402
+from fastsegmentator._vendor.nnunetv2.training.nnUNetTrainer.variants.data_augmentation.nnUNetTrainerNoMirroring import nnUNetTrainerNoMirroring  # noqa: E402
 
 
 class nnUNetTrainer_DASegOrd0(nnUNetTrainer): pass
@@ -81,30 +81,30 @@ nnunet_infer_nii.recursive_find_python_class = _custom_find_class
 
 # --- Project imports ---------------------------------------------------------
 
-from nnunetv2.preprocessing.cropping.cropping import (  # noqa: E402
+from fastsegmentator._vendor.nnunetv2.preprocessing.cropping.cropping import (  # noqa: E402
     crop_to_nonzero, crop_to_mask_gpu, undo_crop_gpu,
 )
-from nnunetv2.preprocessing.preprocessors.default_preprocessor import DefaultPreprocessor  # noqa: E402
-from nnunetv2.preprocessing.resampling.default_resampling import (  # noqa: E402
+from fastsegmentator._vendor.nnunetv2.preprocessing.preprocessors.default_preprocessor import DefaultPreprocessor  # noqa: E402
+from fastsegmentator._vendor.nnunetv2.preprocessing.resampling.default_resampling import (  # noqa: E402
     compute_new_shape, torch_resample_data_or_seg_to_shape,
 )
-from nnunetv2.utilities.helpers import empty_cache  # noqa: E402
-from nnunetv2.utilities.utils import log_runtime  # noqa: E402
-from totalsegmentator.alignment import undo_canonical as tseg_undo_canonical  # noqa: E402
-from totalsegmentator.config import get_weights_dir  # noqa: E402
+from fastsegmentator._vendor.nnunetv2.utilities.helpers import empty_cache  # noqa: E402
+from fastsegmentator._vendor.nnunetv2.utilities.utils import log_runtime  # noqa: E402
+from fastsegmentator._vendor.totalsegmentator.alignment import undo_canonical as tseg_undo_canonical  # noqa: E402
+from fastsegmentator._vendor.totalsegmentator.config import get_weights_dir  # noqa: E402
 # Crop + connected-component postprocess: GPU/CuPy ports (bit-identical to the official
 # numpy/scipy versions) keep the whole pipeline on GPU. extract_skin / remove_auxiliary_labels
 # stay official (no-op / negligible).
-from totalsegmentator.postprocessing import extract_skin, remove_auxiliary_labels  # noqa: E402
-from nnunetv2.postprocessing.gpu_postprocessing import (  # noqa: E402
+from fastsegmentator._vendor.totalsegmentator.postprocessing import extract_skin, remove_auxiliary_labels  # noqa: E402
+from fastsegmentator._vendor.nnunetv2.postprocessing.gpu_postprocessing import (  # noqa: E402
     keep_largest_blob_multilabel_gpu, remove_small_blobs_multilabel_gpu, remove_outside_of_mask_gpu,
 )
-from totalsegmentator.map_to_binary import (  # noqa: E402
+from fastsegmentator._vendor.totalsegmentator.map_to_binary import (  # noqa: E402
     class_map, class_map_5_parts, class_map_parts_mr, class_map_parts_headneck_muscles,
     map_taskid_to_partname_ct, map_taskid_to_partname_mr, map_taskid_to_partname_headneck_muscles,
 )
-from totalsegmentator.resampling import change_spacing as tseg_change_spacing  # noqa: E402
-from totalsegmentator.libs import reorder_multilabel_like_v1  # noqa: E402
+from fastsegmentator._vendor.totalsegmentator.resampling import change_spacing as tseg_change_spacing  # noqa: E402
+from fastsegmentator._vendor.totalsegmentator.libs import reorder_multilabel_like_v1  # noqa: E402
 
 from .nnunet_infer_nii import SimplePredictor  # noqa: E402
 

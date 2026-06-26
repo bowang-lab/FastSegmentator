@@ -19,9 +19,10 @@ is fixed import/model-load overhead amortized in batch).
 - [**uv**](https://docs.astral.sh/uv/) for environment management
 
 FastSegmentator is **self-contained**: a trimmed, GPU-modified fork of `nnunetv2`
-(in `src/`) and the TotalSegmentator subset it needs (in `totalsegmentator/`) are
-**vendored into the package** (see [`NOTICE`](NOTICE)) — no sibling checkouts or
-external installs of those two projects are required.
+and the TotalSegmentator subset it needs are **vendored under a private namespace**
+(`fastsegmentator/_vendor/`, see [`NOTICE`](NOTICE)) — no sibling checkouts or
+external installs of those two projects are required, and the private namespace
+avoids any collision with the real `nnunetv2` / `totalsegmentator` PyPI packages.
 
 > **CUDA prerequisites.** The GPU stack (`cupy-cuda12x`, `cucim-cu12`, and the pinned
 > CUDA 12.1 `torch`/`torchvision` wheels) needs a working CUDA 12 toolchain. `torch`

@@ -19,7 +19,6 @@ import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
-sys.path.insert(0, str(REPO / "src"))
 
 torch = pytest.importorskip("torch")
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -30,7 +29,7 @@ cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 # ---------------------------------------------------------------------------
 @cuda
 def test_cubic_resample_matches_scipy_order3():
-    from nnunetv2.preprocessing.resampling.default_resampling import (
+    from fastsegmentator._vendor.nnunetv2.preprocessing.resampling.default_resampling import (
         torch_resample_data_or_seg_to_shape as TR, resample_data_or_seg_to_shape as SCI)
     from scipy.ndimage import gaussian_filter
     np.random.seed(0)
@@ -46,7 +45,7 @@ def test_cubic_resample_matches_scipy_order3():
 
 @cuda
 def test_cubic_resample_deterministic():
-    from nnunetv2.preprocessing.resampling.default_resampling import torch_resample_data_or_seg_to_shape as TR
+    from fastsegmentator._vendor.nnunetv2.preprocessing.resampling.default_resampling import torch_resample_data_or_seg_to_shape as TR
     a = torch.rand(1, 50, 60, 40, device="cuda")
     r1 = TR(a, (40, 40, 40), [1, 1, 2], [1.5, 1.5, 1.5], order=3, force_separate_z=None)
     r2 = TR(a, (40, 40, 40), [1, 1, 2], [1.5, 1.5, 1.5], order=3, force_separate_z=None)
@@ -59,8 +58,8 @@ def test_cubic_resample_deterministic():
 @cuda
 def test_crop_to_mask_gpu_matches_official():
     import nibabel as nib
-    from nnunetv2.preprocessing.cropping.cropping import crop_to_mask_gpu, undo_crop_gpu
-    from totalsegmentator.cropping import crop_to_mask, undo_crop
+    from fastsegmentator._vendor.nnunetv2.preprocessing.cropping.cropping import crop_to_mask_gpu, undo_crop_gpu
+    from fastsegmentator._vendor.totalsegmentator.cropping import crop_to_mask, undo_crop
     np.random.seed(1)
     aff = np.diag([0.7, 0.7, 1.5, 1.0]); aff[:3, 3] = [10, 20, 30]
     img = nib.Nifti1Image((np.random.rand(120, 140, 90) * 2000 - 1000).astype(np.int16), aff)
@@ -82,7 +81,7 @@ def test_crop_to_mask_gpu_matches_official():
 def test_crop_handles_negative_strides():
     """nibabel canonical/undo views can have negative strides; crop must not crash."""
     import nibabel as nib
-    from nnunetv2.preprocessing.cropping.cropping import crop_to_mask_gpu
+    from fastsegmentator._vendor.nnunetv2.preprocessing.cropping.cropping import crop_to_mask_gpu
     arr = np.ascontiguousarray((np.random.rand(40, 40, 30) * 1000).astype(np.float32))[::-1]  # negative stride
     img = nib.Nifti1Image(arr, np.eye(4))
     m = np.zeros((40, 40, 30), np.uint8); m[10:30, 10:30, 5:25] = 1
@@ -96,9 +95,9 @@ def test_crop_handles_negative_strides():
 @cuda
 def test_gpu_postprocess_matches_scipy():
     pytest.importorskip("cupy")
-    from nnunetv2.postprocessing.gpu_postprocessing import (
+    from fastsegmentator._vendor.nnunetv2.postprocessing.gpu_postprocessing import (
         keep_largest_blob_multilabel_gpu, remove_small_blobs_multilabel_gpu, remove_outside_of_mask_gpu)
-    from totalsegmentator.postprocessing import (
+    from fastsegmentator._vendor.totalsegmentator.postprocessing import (
         keep_largest_blob_multilabel, remove_small_blobs_multilabel, remove_outside_of_mask)
     cm = {1: "a", 2: "b"}
     data = np.zeros((80, 80, 80), np.uint8)
