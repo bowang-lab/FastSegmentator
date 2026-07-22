@@ -25,7 +25,7 @@ is fixed import/model-load overhead amortized in batch).
    `[tool.uv.sources]` in `pyproject.toml`):
 
 ```bash
-git clone https://github.com/JunMa11/FastSegmentator.git
+git clone https://github.com/bowang-lab/FastSegmentator.git
 git clone https://github.com/wasserth/TotalSegmentator.git   # sibling of FastSegmentator
 cd FastSegmentator
 ```
